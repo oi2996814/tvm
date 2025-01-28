@@ -221,7 +221,7 @@ class AOTMainLowerer : public MixedModeVisitor {
     IRModule lowered_mod = GetRef<IRModule>(mod.CopyOnWrite());
 
     auto lowered_main = lowered_mod->Lookup("main");
-    auto lowered_main_func = GetRef<Function>(lowered_main.as<FunctionNode>());
+    auto lowered_main_func = Downcast<Function>(lowered_main);
 
     // Assign StorageInfo to all the Relay exprs and get the return SIDs
     std::tie(expr_storage_map_, return_sid_) = CreateStorage(lowered_main_func);
@@ -303,7 +303,6 @@ class AOTMainLowerer : public MixedModeVisitor {
       // TODO(mbs): device_copy cleaunp
       // Suspect treating as no-op is better since already built into the StorageInfo?
       LOG(FATAL) << "The AOT executor does not currently support device_copy";
-      return;
     }
 
     // At this point we should only see calls of the form call_lowered(@callee, (args...)),
@@ -418,7 +417,7 @@ class AOTMainLowerer : public MixedModeVisitor {
    * runner function needs to be legalized by the LegalizePackedCalls pass.
    */
   tir::PrimFunc CreateMainFunc(String mod_name) {
-    tir::Stmt body = tir::SeqStmt(stmts_);
+    tir::Stmt body = tir::SeqStmt::Flatten(stmts_);
     // Allocate the sids
     std::unordered_map<int, bool> allocated;
     std::vector<std::pair<int64_t, int64_t>> sids_to_allocate;
@@ -493,13 +492,18 @@ class AOTMainLowerer : public MixedModeVisitor {
         Array<tir::Var>(main_signature_.begin() + input_vars_.size(),
                         main_signature_.begin() + input_vars_.size() + return_sid_.size());
     dict_attrs.Set("output_vars", output_vars);
+    Array<String> device_names;
+    for (const auto& it : devices_) {
+      device_names.push_back(it.first);
+    }
+    dict_attrs.Set("devices", device_names);
 
     tir::Stmt device_activations = GenerateAllDeviceHook("Activate");
     tir::Stmt device_deactivations = GenerateAllDeviceHook("Deactivate");
     tir::Stmt final_body = tir::SeqStmt({device_activations, body, device_deactivations});
 
     // Make the PrimFunc
-    return tir::PrimFunc(main_signature_, final_body, VoidType(), main_buffer_map_, {},
+    return tir::PrimFunc(main_signature_, final_body, VoidType(), main_buffer_map_,
                          DictAttrs(dict_attrs));
   }
 
@@ -670,7 +674,7 @@ class AOTMainLowerer : public MixedModeVisitor {
       }));
     }
 
-    tir::Stmt body = tir::SeqStmt({func_call});
+    tir::Stmt body = tir::SeqStmt::Flatten(func_call);
     stmts_.push_back(body);
   }
 
@@ -713,7 +717,7 @@ class AOTMainLowerer : public MixedModeVisitor {
                                         {tvm::tir::StringImm(device_hook_name), context})));
       device_hooks.push_back(device_hook);
     }
-    return tir::SeqStmt(device_hooks);
+    return tir::SeqStmt::Flatten(device_hooks);
   }
 
   /*!

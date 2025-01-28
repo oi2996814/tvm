@@ -46,6 +46,7 @@ class TensorizeComparator : public ExprComparator, public StmtComparator {
   bool VisitExpr(const PrimExpr& n, const PrimExpr& other) override;
   bool VisitStmt(const Stmt& n, const Stmt& other) override;
 
+  bool VisitExpr_(const CallNode* op, const PrimExpr& other) override;
   bool VisitStmt_(const ForNode* op, const Stmt& other) override;
   bool VisitStmt_(const SeqStmtNode* op, const Stmt& other) override;
   bool VisitStmt_(const BufferStoreNode* op, const Stmt& other) override;
@@ -102,8 +103,13 @@ class TensorizeComparator : public ExprComparator, public StmtComparator {
   bool assert_mode_;
   /*! \brief Whether it is visiting the scope block (the outermost block). */
   bool is_scope_block = true;
-  /*! \brief The arithmetic analyzer. */
+  /*! \brief The arithmetic analyzer for comparing LHS and RHS */
   arith::Analyzer analyzer_;
+  /*!
+   * \brief The arithmetic analyzer for simplifying expressions on LHS.
+   *  This analyzer only contains the domains of the iterators on LHS.
+   */
+  arith::Analyzer lhs_analyzer_;
   /*! \brief Additional error messages. Only used when assert_mode is true. */
   std::vector<std::string> error_messages_;
   // variable remap if any

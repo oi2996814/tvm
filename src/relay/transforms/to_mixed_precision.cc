@@ -31,6 +31,7 @@
 
 #include <utility>
 
+#include "../../support/scalars.h"
 #include "pattern_utils.h"
 
 namespace tvm {
@@ -65,7 +66,7 @@ using CachedCastNodes = std::unordered_map<std::pair<const ExprNode*, DataType>,
 // Return array is of type : [MixedTypeConversionCategory (int), String, String]
 // The fields are          : [ConversionCategory, accumulation_datatype, output_datatype]
 // Call is a call node, DataType is the mixed precision type
-using FTVMMixedPrecisionConversionType = runtime::TypedPackedFunc<Array<ObjectRef>(
+using FTVMMixedPrecisionConversionType = runtime::TypedPackedFunc<Array<Variant<Integer, String>>(
     const Call& call_node, const std::string& target_dtype_str)>;
 
 /*! \brief This class transforms the given relay module into a version where
@@ -109,6 +110,39 @@ class MixedPrecisionPass : public MixedModeMutator {
   const RelayExprNode* root_;
   std::vector<DataType> original_dtype_;
   bool keep_orig_output_dtype_;
+
+  /*! \brief If some of the constant attributes are out of mixed_precision_type_ bounds, then
+   * computation cannot be performed in mixed precision. */
+  bool IsMixedPrecisionApplicableToAttrs(const Attrs& attrs) const {
+    if (attrs.get() != nullptr) {
+      double min_bound;
+      double max_bound;
+      if (mixed_precision_type_.is_float16()) {
+        min_bound = -support::kMaxFloat16;
+        max_bound = support::kMaxFloat16;
+      } else if (mixed_precision_type_.is_bfloat16()) {
+        min_bound = -support::kMaxBFloat16;
+        max_bound = support::kMaxBFloat16;
+      } else if (mixed_precision_type_.is_float8()) {
+        double bound = (mixed_precision_type_.code() == DataType::kE4M3Float) ? support::kMaxE4M3
+                                                                              : support::kMaxE5M2;
+        min_bound = -bound;
+        max_bound = bound;
+      } else if (mixed_precision_type_.is_float()) {
+        min_bound = std::numeric_limits<float>::lowest();
+        max_bound = std::numeric_limits<float>::max();
+      } else {
+        return true;
+      }
+
+      if (auto cur_attrs = attrs.as<ClipAttrs>()) {
+        if (cur_attrs->a_min < min_bound || cur_attrs->a_max > max_bound) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
   Attrs GetNewAttrs(const CallNode* call, const DataType& accumulation_dtype) const {
     /* If the accumulation dtype is in the attributes make a copy and mutate the field. */
@@ -161,7 +195,9 @@ class MixedPrecisionPass : public MixedModeMutator {
      */
     DataType cur_type = (attrs->out_dtype);
     ObjectPtr<T> new_attrs = make_object<T>(*attrs);
-    if (cur_type.is_float() || cur_type.is_void()) new_attrs->out_dtype = accumulation_dtype;
+    if (cur_type.is_float() || cur_type.is_bfloat16() || cur_type.is_void()) {
+      new_attrs->out_dtype = accumulation_dtype;
+    }
     return Attrs(new_attrs);
   }
 
@@ -175,7 +211,9 @@ class MixedPrecisionPass : public MixedModeMutator {
     */
     DataType cur_type = (attrs->dtype);
     ObjectPtr<T> new_attrs = make_object<T>(*attrs);
-    if (cur_type.is_float() || cur_type.is_void()) new_attrs->dtype = accumulation_dtype;
+    if (cur_type.is_float() || cur_type.is_bfloat16() || cur_type.is_void()) {
+      new_attrs->dtype = accumulation_dtype;
+    }
     return Attrs(new_attrs);
   }
 
@@ -209,7 +247,6 @@ class MixedPrecisionPass : public MixedModeMutator {
       return true;
     } else {
       LOG(FATAL) << "Unsupported type " << t << " we don't know how to handle";
-      return false;
     }
   }
 
@@ -217,7 +254,7 @@ class MixedPrecisionPass : public MixedModeMutator {
     /* Cast tensor to the wanted datatype, returning a cached version if it's already been done. */
 
     // If this is not a floating point type, do not cast. E.g. it might be an integer
-    if (!expr_dtype.is_float()) {
+    if (!(expr_dtype.is_float() || expr_dtype.is_bfloat16())) {
       return expr;
     }
 
@@ -299,7 +336,7 @@ class MixedPrecisionPass : public MixedModeMutator {
         original_dtype_.push_back((root_->checked_type_).as<TensorTypeNode>()->dtype);
       }
     }
-    if (!mixed_precision_type_.is_float() && !mixed_precision_type_.is_bfloat16()) {
+    if (!(mixed_precision_type_.is_float() || mixed_precision_type_.is_bfloat16())) {
       LOG(FATAL) << "Only support IEEE floating point mixed precision types and bfloat16, but got "
                  << mixed_precision_type_;
     }
@@ -313,10 +350,11 @@ class MixedPrecisionPass : public MixedModeMutator {
 
     // TODO(AndrewZhaoLuo): Support ADTs
     // Relay's algebraic data types are not supported yet.
-    ICHECK(!cur_op.as<GlobalVarNode>()       // used to declare functions for recursion
-           && !cur_op.as<ConstructorNode>()  // constructing ADT types
-           && !cur_op.as<VarNode>())         // used for calling recursive functions
-        << "Algebraic Data Types (ADT) are not supported yet for mixed precision pass.";
+    bool isADT = (cur_op.as<GlobalVarNode>()       // used to declare functions for recursion
+                  || cur_op.as<ConstructorNode>()  // constructing ADT types
+                  || cur_op.as<LetNode>()          // used for binding lambdas
+                  || cur_op.as<VarNode>());        // used for calling recursive functions
+    if (isADT) return post;
 
     // Get info on the operation being called:
     // conversion category (int), accumulation dtype (str), output dtype (str)
@@ -334,7 +372,7 @@ class MixedPrecisionPass : public MixedModeMutator {
       if (attr_map.count(op)) {
         // Calculate the conversion category and dtypes from registered attribute.
         FTVMMixedPrecisionConversionType func = attr_map[op];
-        Array<ObjectRef> op_descriptor =
+        Array<Variant<Integer, String>> op_descriptor =
             func(GetRef<Call>(pre_call_node), DLDataType2String(mixed_precision_type_));
         ICHECK(op_descriptor.size() == 3)
             << "got the wrong number of returned arguments (expected 3 got " << op_descriptor.size()
@@ -379,9 +417,12 @@ class MixedPrecisionPass : public MixedModeMutator {
           all_args_mixed_type_compatible ? MIXED_PRECISION_ALWAYS : MIXED_PRECISION_NEVER;
     }
 
+    bool is_mixed_precision_applicable =
+        static_cast<bool>(final_category == MIXED_PRECISION_ALWAYS &&
+                          IsMixedPrecisionApplicableToAttrs(pre_call_node->attrs));
     // Create the new arguments to the call.
     DataType wanted_arg_dtypes =
-        final_category == MIXED_PRECISION_ALWAYS ? mixed_precision_type_ : DataType::Float(32);
+        is_mixed_precision_applicable ? mixed_precision_type_ : DataType::Float(32);
     auto call_args_and_types = CastAllArgs(post_call_node->args, cur_arg_types, wanted_arg_dtypes);
     Array<Expr> new_args = call_args_and_types.first;
     Array<Type> new_arg_types;
@@ -394,7 +435,7 @@ class MixedPrecisionPass : public MixedModeMutator {
     }
 
     // Finally create the new attributes.
-    if (final_category == MIXED_PRECISION_ALWAYS) {
+    if (is_mixed_precision_applicable) {
       Attrs new_attrs = GetNewAttrs(pre_call_node, accumulation_dtype);
       Expr output = Call(cur_op, new_args, new_attrs, new_arg_types, pre_call_node->span);
       if (accumulation_dtype != output_dtype) {

@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=unused-argument
 
 """Pytest plugin for using tvm testing extensions.
 
@@ -54,9 +55,7 @@ MARKERS = {
     "vulkan": "mark a test as requiring vulkan",
     "metal": "mark a test as requiring metal",
     "llvm": "mark a test as requiring llvm",
-    "ethosn": "mark a test as requiring ethosn",
     "hexagon": "mark a test as requiring hexagon",
-    "corstone300": "mark a test as requiring Corstone300 FVP",
 }
 
 
@@ -70,11 +69,21 @@ def pytest_configure(config):
     print("pytest marker:", config.option.markexpr)
 
 
+def pytest_addoption(parser):
+    """Add pytest options."""
+    parser.addoption("--gtest_args", action="store", default="")
+
+
 def pytest_generate_tests(metafunc):
     """Called once per unit test, modifies/parametrizes it as needed."""
     _parametrize_correlated_parameters(metafunc)
     _auto_parametrize_target(metafunc)
     _add_target_specific_marks(metafunc)
+
+    # Process gtest arguments
+    option_value = metafunc.config.option.gtest_args
+    if "gtest_args" in metafunc.fixturenames and option_value is not None:
+        metafunc.parametrize("gtest_args", [option_value])
 
 
 def pytest_collection_modifyitems(config, items):
@@ -350,7 +359,7 @@ if HAVE_XDIST:
                 # serialized
                 items = {
                     "test_tvm_testing_features": "functional-tests",
-                    "tests/python/unittest/test_crt": "crt-tests",
+                    "tests/python/micro/test_crt": "crt-tests",
                     "tests/python/driver/tvmc": "tvmc-tests",
                 }
 

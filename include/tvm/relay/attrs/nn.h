@@ -197,12 +197,14 @@ struct ConvWinogradWeightTransformAttrs : public tvm::AttrsNode<ConvWinogradWeig
 
 /*! \brief Attributes used in gemm weight transformation operators */
 struct ConvGemmWeightTransformAttrs : public tvm::AttrsNode<ConvGemmWeightTransformAttrs> {
-  int tile_rows;
-  int tile_cols;
+  int tile_N;
+  int tile_K;
 
   TVM_DECLARE_ATTRS(ConvGemmWeightTransformAttrs, "relay.attrs.ConvGemmWeightTransformAttrs") {
-    TVM_ATTR_FIELD(tile_rows).describe("Tile rows of the weight transformation for ConvGemm.");
-    TVM_ATTR_FIELD(tile_cols).describe("Tile columns of the weight transformation for ConvGemm.");
+    TVM_ATTR_FIELD(tile_N).describe(
+        "Tile size across N axis of the weight transformation for ConvGemm. (N = OC)");
+    TVM_ATTR_FIELD(tile_K).describe(
+        "Tile size across K axis of the weight transformation for ConvGemm. (K = KW * KH * IC)");
   }
 };
 
@@ -430,10 +432,10 @@ struct Conv3DTransposeAttrs : public tvm::AttrsNode<Conv3DTransposeAttrs> {
             "dimensions respectively. Convolution is applied on the 'D', 'H' and"
             "'W' dimensions.");
     TVM_ATTR_FIELD(kernel_layout)
-        .set_default("OIDHW")
+        .set_default("IODHW")
         .describe(
-            "Dimension ordering of data and weight. Can be 'OIDHW', 'OIDHW16o16i', etc."
-            "'O', 'I', 'D', 'H', 'W' stands for num_filter, input_channel, depth, height, and width"
+            "Dimension ordering of data and weight. Can be 'IODHW', 'IODHW16i16o', etc."
+            "'I', 'O', 'D', 'H', 'W' stands for input_channel, num_filter, depth, height, and width"
             "dimensions respectively.");
     TVM_ATTR_FIELD(out_layout)
         .set_default("")
@@ -588,10 +590,10 @@ struct Conv2DTransposeAttrs : public tvm::AttrsNode<Conv2DTransposeAttrs> {
             "dimensions respectively. Convolution is applied on the 'H' and"
             "'W' dimensions.");
     TVM_ATTR_FIELD(kernel_layout)
-        .set_default("OIHW")
+        .set_default("IOHW")
         .describe(
-            "Dimension ordering of data and weight. Can be 'OIHW', 'OIHW16o16i', etc."
-            "'O', 'I', 'H', 'W' stands for num_filter, input_channel, height, and width"
+            "Dimension ordering of data and weight. Can be 'IOHW', 'OIHW16o16i', etc."
+            "'I', 'O', 'H', 'W' stands for input_channel, num_filter, height, and width"
             "dimensions respectively.");
     TVM_ATTR_FIELD(out_layout)
         .set_default("")
@@ -671,10 +673,10 @@ struct Conv1DTransposeAttrs : public tvm::AttrsNode<Conv1DTransposeAttrs> {
             "dimensions respectively. Convolution is applied on the"
             "'W' dimension.");
     TVM_ATTR_FIELD(kernel_layout)
-        .set_default("OIW")
+        .set_default("IOW")
         .describe(
-            "Dimension ordering of data and weight. Can be 'OIW', 'OIW16o16i', etc."
-            "'O', 'I', 'W' stands for num_filter, input_channel, and width"
+            "Dimension ordering of data and weight. Can be 'IOW', 'IOW16o16i', etc."
+            "'I', 'O', 'W' stands for input_channel, num_filter and width"
             "dimensions respectively.");
     TVM_ATTR_FIELD(out_layout)
         .set_default("")
@@ -1052,7 +1054,8 @@ struct MatmulAttrs : public tvm::AttrsNode<MatmulAttrs> {
   DataType out_dtype;
   bool transpose_a;
   bool transpose_b;
-  tvm::String auto_scheduler_rewritten_layout;   // The layout after auto-scheduler's layout rewrite
+  // layout of B after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;
   Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
 
   TVM_DECLARE_ATTRS(MatmulAttrs, "relay.attrs.MatmulAttrs") {
@@ -1076,7 +1079,8 @@ struct MatmulAttrs : public tvm::AttrsNode<MatmulAttrs> {
 /*! \brief Attributes for dense operator */
 struct DenseAttrs : public tvm::AttrsNode<DenseAttrs> {
   IndexExpr units;
-  tvm::String auto_scheduler_rewritten_layout;   // The layout after auto-scheduler's layout rewrite
+  // layout of B after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;
   Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
   DataType out_dtype;
 

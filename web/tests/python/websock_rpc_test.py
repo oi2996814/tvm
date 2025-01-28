@@ -23,7 +23,7 @@ Connect javascript end to the websocket port and connect to the RPC.
 import tvm
 from tvm import te
 from tvm import rpc
-from tvm.contrib import utils, emcc
+from tvm.contrib import utils, tvmjs
 from tvm.relay.backend import Runtime
 import numpy as np
 
@@ -48,7 +48,7 @@ def test_rpc():
     temp = utils.tempdir()
 
     wasm_path = temp.relpath("addone.wasm")
-    fadd.export_library(wasm_path, emcc.create_tvmjs_wasm)
+    fadd.export_library(wasm_path, fcompile=tvmjs.create_tvmjs_wasm)
 
     wasm_binary = open(wasm_path, "rb").read()
 
@@ -69,7 +69,6 @@ def test_rpc():
         assert fecho(100, 2, 3) == 100
         assert fecho("xyz") == "xyz"
         assert bytes(fecho(bytearray(b"123"))) == b"123"
-
         # run the generated library.
         f1 = remote.system_lib()
         dev = remote.cpu(0)

@@ -73,6 +73,42 @@ bool DFPatternMatcher::VisitDFPattern_(const AltPatternNode* op, const Expr& exp
 }
 
 bool MatchRetValue(const ObjectRef& lhs, const TVMRetValue& rhs) {
+  // Unwrapping arrays may find user-provided FFI types in the
+  // attributes (e.g. Defining pad_value as ((0,0), (0,0)) will result
+  // in runtime::Int.  These need to be converted to compile-time IR
+  // types when encountered.
+  if (lhs->IsInstance<runtime::Bool::ContainerType>() ||
+      lhs->IsInstance<runtime::Int::ContainerType>() ||
+      lhs->IsInstance<runtime::Float::ContainerType>()) {
+    TVMRetValue lhs_convert;
+    lhs_convert = lhs;
+    PrimExpr lhs_expr = lhs_convert;
+    return MatchRetValue(lhs_expr, rhs);
+  }
+
+  // StructuralEqual doesn't check for conversions between FFI types
+  // and IR types, but the pattern-matcher should.  Therefore,
+  // explicitly recurse into the array.
+  if (auto opt_lhs_array = lhs.as<Array<ObjectRef>>()) {
+    if (Optional<Array<ObjectRef>> opt_rhs_array = rhs) {
+      Array<ObjectRef> lhs_array = opt_lhs_array.value();
+      Array<ObjectRef> rhs_array = opt_rhs_array.value();
+      if (lhs_array.size() != rhs_array.size()) {
+        return false;
+      }
+      for (size_t i = 0; i < lhs_array.size(); i++) {
+        TVMRetValue rhs_item;
+        rhs_item = rhs_array[i];
+        if (!MatchRetValue(lhs_array[i], rhs_item)) {
+          return false;
+        }
+      }
+      return true;
+    } else {
+      return false;
+    }
+  }
+
   switch (rhs.type_code()) {
     case kDLInt:
       if (auto* val = lhs.as<IntImmNode>()) {
@@ -128,8 +164,8 @@ bool DFPatternMatcher::VisitDFPattern_(const AttrPatternNode* attr_pattern, cons
     return matches;
   }
   auto attributes = attr_pattern->attrs.as<DictAttrsNode>()->dict;
-  if (const auto* op_node = expr.as<OpNode>()) {
-    Op op = GetRef<Op>(op_node);
+  if (auto optional = expr.as<Op>()) {
+    Op op = optional.value();
     for (auto kv : attributes) {
       auto attr_name = kv.first;
       auto attr_value = kv.second;
@@ -300,14 +336,20 @@ bool DFPatternMatcher::VisitDFPattern_(const CallPatternNode* op, const Expr& ex
 
 // Recursively find the Dominator parent along all inputs paths.
 bool DFPatternMatcher::MatchesPath(const DominatorPatternNode* op, const Expr& expr) {
+  // utilities
+  auto is_leaf_node = [](const Expr& expr) {
+    return expr.as<ConstantNode>() || expr.as<VarNode>();
+  };
+
+  // logic
   auto call_node = expr.as<CallNode>();
   auto index_node = expr_to_node(expr);
+  size_t arg_counter{0};
   for (auto node : index_node->inputs_) {
-    if (!(call_node && node->ref() == call_node->op)) {
+    if (!(call_node && (node->ref() == call_node->op || is_leaf_node(node->ref())))) {
+      arg_counter += 1;
       memoize_ = true;
-      if (VisitDFPattern(op->parent, node->ref())) {
-        return true;
-      } else {
+      if (!VisitDFPattern(op->parent, node->ref())) {
         memoize_ = false;
         if (!VisitDFPattern(op->path, node->ref())) {
           return false;
@@ -317,6 +359,9 @@ bool DFPatternMatcher::MatchesPath(const DominatorPatternNode* op, const Expr& e
         }
       }
     }
+  }
+  if (!arg_counter) {
+    return false;
   }
   return true;
 }
@@ -427,16 +472,6 @@ bool DFPatternMatcher::VisitDFPattern_(const LetPatternNode* op, const Expr& exp
   return false;
 }
 
-Expr InferType(const Expr& expr) {
-  auto mod = IRModule::FromExpr(expr);
-  mod = transform::InferType()(mod);
-  if (expr.as<FunctionNode>()) {
-    return mod->Lookup("main");
-  } else {
-    return mod->Lookup("main").as<FunctionNode>()->body;
-  }
-}
-
 Expr InferTypeWithModule(const Expr& expr, const IRModule& m) {
   IRModule mod(m->functions, m->type_definitions, m->Imports());
   GlobalVarSupply global_var_supply = GlobalVarSupply(mod);
@@ -445,7 +480,7 @@ Expr InferTypeWithModule(const Expr& expr, const IRModule& m) {
   if (expr.as<FunctionNode>()) {
     func = Downcast<Function>(expr);
   } else {
-    func = relay::Function(relay::FreeVars(expr), expr, Type(), relay::FreeTypeVars(expr, mod), {});
+    func = relay::Function(relay::FreeVars(expr), expr, Type(), relay::FreeTypeVars(expr, mod));
   }
   mod->Add(gvar, func);
   mod = transform::InferType()(mod);
@@ -495,7 +530,11 @@ bool DFPatternMatcher::VisitDFPattern_(const ConstantPatternNode* op, const Expr
 }
 
 bool DFPatternMatcher::VisitDFPattern_(const WildcardPatternNode* op, const Expr& expr) {
-  return true;
+  if (op->pattern) {
+    return VisitDFPattern(op->pattern.value(), expr);
+  } else {
+    return true;
+  }
 }
 
 bool MatchPattern(DFPattern pattern, Expr expr) {
@@ -615,19 +654,23 @@ void PatternGrouper::CreateGroup(const Expr& expr) {
     // Don't treat fuzzy Dominator patterns input variables for partition
     if (auto op = node->ref().as<DominatorPatternNode>()) {
       for (auto fuzzy_op : {op->parent, op->path}) {
-        for (auto match : node_map[fuzzy_op]) {
-          fuzzy_matches.insert(match);
+        if (node_map.count(fuzzy_op)) {
+          for (auto match : node_map[fuzzy_op]) {
+            fuzzy_matches.insert(match);
+          }
         }
       }
     }
     // Don't treat Function params or body as input variables for partition
     if (node->ref().as<FunctionPatternNode>()) {
-      auto matches = node_map[node->ref()];
-      for (auto match : matches) {
-        auto sub_graph = CreateIndexedGraph(match.as<FunctionNode>()->body);
-        for (PostDfsIndex sub_index = 0; sub_index < sub_graph->size(); ++sub_index) {
-          auto sub_node = sub_graph->index_to_node(sub_index);
-          fuzzy_matches.insert(sub_node->ref());
+      if (node_map.count(node->ref())) {
+        auto matches = node_map[node->ref()];
+        for (auto match : matches) {
+          auto sub_graph = CreateIndexedGraph(match.as<FunctionNode>()->body);
+          for (PostDfsIndex sub_index = 0; sub_index < sub_graph->size(); ++sub_index) {
+            auto sub_node = sub_graph->index_to_node(sub_index);
+            fuzzy_matches.insert(sub_node->ref());
+          }
         }
       }
     }
@@ -804,24 +847,43 @@ Expr PatternRewriter::Rewrite(const Array<DFPatternCallback>& callbacks, const E
   bool equal = true;
   static auto* structural_equal = runtime::Registry::Get("node.StructuralEqual");
   ICHECK(structural_equal) << "node.StructuralEqual is not registered.";
+  // Keep track of callbacks that have finished rewriting
+  std::unordered_map<DFPatternCallback, bool, ObjectPtrHash, ObjectPtrEqual> done;
   do {
     last = post;
+    // We don't have to call InferType if previous pass has not modified anything
+    // We can just take previous typed state of the expression
+    bool types_invalidated = true;
     for (auto callback : callbacks) {
-      callback_ = callback;
-      if (callback_->require_type) {
-        post = InferTypeWithModule(post, mod_);
+      if (!done[callback]) {
+        auto before = post;
+        auto post_typed = post;
+        callback_ = callback;
+        if (callback_->require_type && types_invalidated) {
+          post_typed = InferTypeWithModule(post, mod_);
+        }
+        auto grouper = PatternGrouper();
+        groups_ = grouper.GroupMatches(callback_->pattern, post_typed);
+        gid_assignments_ = grouper.GetGIDAssignments();
+        memo_.clear();
+        VLOG(1) << "pre rewritten:" << std::endl << PrettyPrint(pre);
+        post = this->VisitExpr(post_typed);
+        VLOG(1) << "post rewritten:" << std::endl << PrettyPrint(post);
+        count++;
+        bool current_equal = (*structural_equal)(before, post, false, true);
+        if (callback_->require_type && current_equal) {
+          types_invalidated = false;
+          post = post_typed;
+        } else {
+          types_invalidated = true;
+          if (callback_->rewrite_once) {
+            done[callback] = true;
+          }
+        }
       }
-      auto grouper = PatternGrouper();
-      groups_ = grouper.GroupMatches(callback_->pattern, post);
-      gid_assignments_ = grouper.GetGIDAssignments();
-      memo_.clear();
-      VLOG(1) << "pre rewritten:" << std::endl << PrettyPrint(pre);
-      post = this->VisitExpr(post);
-      VLOG(1) << "post rewritten:" << std::endl << PrettyPrint(post);
-      count++;
     }
     equal = (*structural_equal)(last, post, false, true);
-  } while (!equal && count < 100 && !callback_->rewrite_once);
+  } while (!equal && count < 100);
   if (count >= 100) {
     LOG(FATAL) << "Observed 100 rewrite passes, possible conflicting passes?";
   }

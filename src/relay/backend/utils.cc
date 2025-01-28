@@ -25,11 +25,12 @@
 
 #include "utils.h"
 
-#include <tvm/parser/parser.h>
+#include <tvm/relay/parser.h>
 #include <tvm/relay/qnn/transform.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "../../arith/scalable_expression.h"
 #include "../../te/operation/create_primfunc.h"
 
 namespace tvm {
@@ -274,6 +275,7 @@ Array<Pass> GetPassPrefix(bool is_homogeneous, bool is_vm) {
       pass_seqs.push_back(transform::InferType());
     }
     pass_seqs.push_back(transform::AlterOpLayout());
+    pass_seqs.push_back(transform::SimplifyExprPostAlterOp());
   }
 
   // Fast math optimizations.
@@ -416,11 +418,12 @@ Optional<tir::PrimFunc> DefaultTIRConverterImpl(const Array<te::Tensor>& args,
       return NullOpt;
     }
   }
-  PrimFunc func = te::CreatePrimFuncWithConstants(args, constants);
+  PrimFunc func = te::CreatePrimFuncWithConstants(args, constants, DataType::Int(64));
   bool dynamic_loop_extent = false;
   tir::PostOrderVisit(func->body, [&dynamic_loop_extent](const ObjectRef& obj) -> void {
     if (const auto* loop = obj.as<tir::ForNode>()) {
-      if (!loop->extent->IsInstance<IntImmNode>()) {
+      if (!loop->extent->IsInstance<IntImmNode>() &&
+          !tvm::arith::ContainsVscaleCall(loop->extent)) {
         dynamic_loop_extent = true;
       }
     }
@@ -441,6 +444,13 @@ TVM_REGISTER_GLOBAL("relay.backend.tir_converter.allow_extern")
     .set_body_typed([](const Array<te::Tensor>& args,
                        const Array<runtime::NDArray>& constants) -> Optional<tir::PrimFunc> {
       return DefaultTIRConverterImpl(args, constants, true);
+    });
+
+TVM_REGISTER_GLOBAL("relay.backend.GetPassPrefixSeq")
+    .set_body_typed([](bool is_homogeneous, bool is_vm) {
+      auto pass_seqs = GetPassPrefix(is_homogeneous, is_vm);
+      transform::Sequential seq(pass_seqs);
+      return seq;
     });
 
 }  // namespace backend

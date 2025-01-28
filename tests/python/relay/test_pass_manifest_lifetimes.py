@@ -24,9 +24,9 @@ import sys
 
 def optimize_and_check(before_program, after_program, passes):
     if isinstance(before_program, str):
-        before_program = tvm.parser.parse(before_program)
+        before_program = tvm.relay.parse(before_program)
     if isinstance(after_program, str):
-        after_program = tvm.parser.parse(after_program)
+        after_program = tvm.relay.parse(after_program)
     if not isinstance(passes, list):
         passes = [passes]
     optimize = tvm.transform.Sequential(passes)
@@ -35,7 +35,7 @@ def optimize_and_check(before_program, after_program, passes):
     print(optimized_program)
     print("Expected:")
     print(after_program)
-    assert tvm.ir.structural_equal(optimized_program, after_program, map_free_vars=True)
+    tvm.ir.assert_structural_equal(optimized_program, after_program, map_free_vars=True)
 
 
 def test_simple_linear():

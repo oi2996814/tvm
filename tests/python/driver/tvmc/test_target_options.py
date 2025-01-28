@@ -35,52 +35,73 @@ def test_target_to_argparse():
     assert parsed.target_llvm_mattr == "+fp,+mve"
 
 
-@tvm.testing.requires_cmsisnn
-def test_target_to_argparse_known_codegen():
+@tvm.testing.requires_mrvl
+def test_target_to_argparse_for_mrvl_hybrid():
     parser = argparse.ArgumentParser()
     generate_target_args(parser)
     parsed, _ = parser.parse_known_args(
         [
-            "--target=cmsis-nn,llvm",
-            "--target-cmsis-nn-mcpu=cortex-m3",
-            "--target-llvm-mattr=+fp,+mve",
-            "--target-llvm-mcpu=cortex-m3",
+            "--target=mrvl, llvm",
+            "--target-mrvl-mattr=wb_pin_ocm=1,quantize=fp16",
+            "--target-mrvl-num_tiles=2",
+            "--target-mrvl-mcpu=cnf10kb",
         ]
     )
-    assert parsed.target == "cmsis-nn,llvm"
-    assert parsed.target_llvm_mcpu == "cortex-m3"
-    assert parsed.target_llvm_mattr == "+fp,+mve"
-    assert parsed.target_cmsis_nn_mcpu == "cortex-m3"
+
+    assert parsed.target == "mrvl, llvm"
+    assert parsed.target_mrvl_mattr == "wb_pin_ocm=1,quantize=fp16"
+    assert parsed.target_mrvl_num_tiles == 2
+    assert parsed.target_mrvl_mcpu == "cnf10kb"
 
 
-def test_mapping_target_args():
-    parser = argparse.ArgumentParser()
-    generate_target_args(parser)
-    parsed, _ = parser.parse_known_args(["--target=llvm", "--target-llvm-mcpu=cortex-m3"])
-    assert reconstruct_target_args(parsed) == {"llvm": {"mcpu": "cortex-m3"}}
-
-
-@tvm.testing.requires_cmsisnn
-def test_include_known_codegen():
+@tvm.testing.requires_mrvl
+def test_default_arg_for_mrvl_hybrid():
     parser = argparse.ArgumentParser()
     generate_target_args(parser)
     parsed, _ = parser.parse_known_args(
-        ["--target=cmsis-nn,c", "--target-cmsis-nn-mcpu=cortex-m55", "--target-c-mcpu=cortex-m55"]
+        [
+            "--target=mrvl, llvm",
+        ]
     )
-    assert reconstruct_target_args(parsed) == {
-        "c": {"mcpu": "cortex-m55"},
-        "cmsis-nn": {"mcpu": "cortex-m55"},
-    }
+    assert parsed.target == "mrvl, llvm"
+    assert parsed.target_mrvl_mcpu == "cn10ka"
+    assert parsed.target_mrvl_num_tiles == 8
 
 
-def test_skip_target_from_codegen():
+@tvm.testing.requires_mrvl
+# Test for default(LLVM) target, when built with USE_MRVL=ON
+def test_mrvl_build_with_llvm_only_target():
     parser = argparse.ArgumentParser()
     generate_target_args(parser)
-    parsed, left = parser.parse_known_args(
-        ["--target=cmsis-nn, c", "--target-cmsis-nn-from_device=1", "--target-c-mcpu=cortex-m55"]
+    parsed, _ = parser.parse_known_args(
+        [
+            "--target=llvm",
+        ]
     )
-    assert left == ["--target-cmsis-nn-from_device=1"]
-    assert reconstruct_target_args(parsed) == {"c": {"mcpu": "cortex-m55"}}
+    assert parsed.target == "llvm"
+
+
+@tvm.testing.requires_vitis_ai
+def test_composite_target_cmd_line_help():
+    parser = argparse.ArgumentParser()
+    generate_target_args(parser)
+    assert parser._option_string_actions["--target-vitis-ai-dpu"].help == "Vitis AI DPU identifier"
+    assert (
+        parser._option_string_actions["--target-vitis-ai-build_dir"].help
+        == "Build directory to be used (optional, debug)"
+    )
+    assert (
+        parser._option_string_actions["--target-vitis-ai-work_dir"].help
+        == "Work directory to be used (optional, debug)"
+    )
+    assert (
+        parser._option_string_actions["--target-vitis-ai-export_runtime_module"].help
+        == "Export the Vitis AI runtime module to this file"
+    )
+    assert (
+        parser._option_string_actions["--target-vitis-ai-load_runtime_module"].help
+        == "Load the Vitis AI runtime module to this file"
+    )
 
 
 def test_target_recombobulation_single():

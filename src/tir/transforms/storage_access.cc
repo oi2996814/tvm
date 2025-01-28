@@ -33,14 +33,6 @@
 namespace tvm {
 namespace tir {
 
-void StorageAccessVisitor::VisitExpr_(const LoadNode* op) {
-  LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
-}
-
-void StorageAccessVisitor::VisitStmt_(const StoreNode* op) {
-  LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
-}
-
 void StorageAccessVisitor::VisitExpr_(const BufferLoadNode* op) {
   Var buf = op->buffer->data;
   StorageScope scope = GetScope(buf);
@@ -100,6 +92,20 @@ void StorageAccessVisitor::VisitStmt_(const EvaluateNode* op) {
     curr_stmt_.access.clear();
   }
   allow_append_ = false;
+}
+
+void StorageAccessVisitor::VisitStmt_(const LetStmtNode* op) {
+  allow_append_ = true;
+  ICHECK_EQ(curr_stmt_.access.size(), 0U);
+  curr_stmt_.stmt = op;
+  this->VisitExpr(op->value);
+  // push to the scope
+  scope_.back().push_back(curr_stmt_);
+  // clear access entry.
+  curr_stmt_.access.clear();
+  allow_append_ = false;
+  // traverse body block
+  this->VisitStmt(op->body);
 }
 
 void StorageAccessVisitor::VisitStmt_(const AttrStmtNode* op) {
@@ -178,8 +184,23 @@ void StorageAccessVisitor::VisitStmt_(const ForNode* op) {
   }
 }
 
+bool IsThreadInvariant(const PrimExpr& cond) {
+  if (auto call = cond.as<CallNode>()) {
+    if (auto opt_call_op = call->op.as<Op>()) {
+      auto call_op = opt_call_op.value();
+      if (call_op.same_as(builtin::tvm_thread_invariant())) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 void StorageAccessVisitor::VisitStmt_(const IfThenElseNode* op) {
-  ++condition_counter_;
+  bool is_thread_invariant = IsThreadInvariant(op->condition);
+  if (!is_thread_invariant) {
+    ++condition_counter_;
+  }
   this->VisitExpr(op->condition);
   scope_.push_back(std::vector<StmtEntry>());
   this->VisitStmt(op->then_case);
@@ -187,19 +208,24 @@ void StorageAccessVisitor::VisitStmt_(const IfThenElseNode* op) {
   s.stmt = op;
   s.access = Summarize(std::move(scope_.back()), nullptr);
   scope_.pop_back();
-  if (op->else_case.defined()) {
+  if (op->else_case) {
     scope_.push_back(std::vector<StmtEntry>());
-    this->VisitStmt(op->else_case);
+    this->VisitStmt(op->else_case.value());
     auto v = Summarize(std::move(scope_.back()), nullptr);
     scope_.pop_back();
     s.access.insert(s.access.end(), v.begin(), v.end());
   }
   scope_.back().emplace_back(std::move(s));
-  --condition_counter_;
+  if (!is_thread_invariant) {
+    --condition_counter_;
+  }
 }
 
 void StorageAccessVisitor::VisitStmt_(const WhileNode* op) {
-  ++condition_counter_;
+  bool is_thread_invariant = IsThreadInvariant(op->condition);
+  if (!is_thread_invariant) {
+    ++condition_counter_;
+  }
   this->VisitExpr(op->condition);
   scope_.push_back(std::vector<StmtEntry>());
   this->VisitStmt(op->body);
@@ -208,7 +234,9 @@ void StorageAccessVisitor::VisitStmt_(const WhileNode* op) {
   s.access = Summarize(std::move(scope_.back()), nullptr);
   scope_.pop_back();
   scope_.back().emplace_back(std::move(s));
-  --condition_counter_;
+  if (!is_thread_invariant) {
+    --condition_counter_;
+  }
 }
 
 void StorageAccessVisitor::VisitExpr_(const CallNode* op) {

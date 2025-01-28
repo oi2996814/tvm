@@ -23,6 +23,7 @@
 #include "codegen_c.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/name_supply.h>
 
 #include <cctype>
 #include <iomanip>
@@ -41,6 +42,7 @@ void CodeGenC::InitFuncState(const PrimFunc& f) {
   alloc_storage_scope_.clear();
   handle_data_type_.clear();
   CodeGenSourceBase::ClearFuncState();
+  ReserveKeywordsAsUnique();
 }
 
 void CodeGenC::ReserveKeywordsAsUnique() {
@@ -74,66 +76,111 @@ void CodeGenC::ReserveKeywordsAsUnique() {
   name_supply_->ReserveName("return");
 }
 
-void CodeGenC::AddFunction(const PrimFunc& f) {
-  // clear previous generated state.
-  this->InitFuncState(f);
-  // reserve keywords
-  ReserveKeywordsAsUnique();
+void CodeGenC::PrintFunctionSignature(const String& function_name, const PrimFunc& func,
+                                      std::ostream& os) {
+  PrintFuncPrefix(os);
+  PrintType(func->ret_type, os);
+  PrintExtraAttrs(func, os);
+  os << " " << function_name << "(";
+  for (size_t i = 0; i < func->params.size(); ++i) {
+    tir::Var v = func->params[i];
 
-  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.defined())
-      << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
-  bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
-
-  this->PrintFuncPrefix();
-  this->PrintExtraAttrs(f);
-  this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
-
-  for (size_t i = 0; i < f->params.size(); ++i) {
-    tir::Var v = f->params[i];
-    std::string vid = AllocVarID(v.get());
-    if (i != 0) stream << ", ";
-    if (v.dtype().is_handle()) {
-      auto it = alloc_storage_scope_.find(v.get());
-      if (it != alloc_storage_scope_.end()) {
-        PrintStorageScope(it->second, stream);
-      }
-
-      PrintType(GetType(v), stream);
-      // Register handle data type
-      // TODO(tvm-team): consider simply keep type info in the
-      // type annotation(via a normalizing rewriting).
-      if (auto* ptr = v->type_annotation.as<PointerTypeNode>()) {
-        if (auto* prim = ptr->element_type.as<PrimTypeNode>()) {
-          RegisterHandleType(v.get(), prim->dtype);
-        }
-      }
-
-      if (no_alias) {
-        PrintRestrict(v, stream);
-      }
-    } else {
-      PrintType(GetType(v), stream);
+    if (i > 0) {
+      os << ", ";
     }
-    stream << ' ' << vid;
+
+    if (auto it = alloc_storage_scope_.find(v.get()); it != alloc_storage_scope_.end()) {
+      PrintStorageScope(it->second, os);
+    }
+
+    PrintType(GetType(v), os);
+
+    bool no_alias = func->HasNonzeroAttr(tir::attr::kNoAlias);
+    bool is_handle = v.dtype().is_handle();
+    if (no_alias && is_handle) {
+      PrintRestrict(v, os);
+    }
+
+    os << " " << AllocVarID(v.get());
   }
-  stream << ") {\n";
+  os << ")";
+
+  // Register handle data type
+  // TODO(tvm-team): consider simply keep type info in the
+  // type annotation(via a normalizing rewriting).
+  for (const auto& param : func->params) {
+    if (auto* ptr = param->type_annotation.as<PointerTypeNode>()) {
+      if (auto* prim = ptr->element_type.as<PrimTypeNode>()) {
+        RegisterHandleType(param.get(), prim->dtype);
+      }
+    }
+  }
+}
+
+void CodeGenC::DeclareFunction(const GlobalVar& gvar, const PrimFunc& func) {
+  if (internal_functions_.count(gvar)) {
+    return;
+  }
+
+  auto function_name = [&]() -> String {
+    if (auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol)) {
+      auto name = global_symbol.value();
+      ICHECK(!func_name_supply_->ContainsName(name))
+          << "Function " << gvar << " must use global symbol " << name
+          << ", but this name has already been used.";
+      func_name_supply_->ReserveName(name);
+      return name;
+    } else {
+      func_name_supply_->ReserveName(gvar->name_hint);
+      return gvar->name_hint;
+    }
+  }();
+
+  internal_functions_.insert({gvar, function_name});
+
+  InitFuncState(func);
+  PrintFunctionSignature(function_name, func, fwd_decl_stream);
+  fwd_decl_stream << ";\n";
+}
+
+String CodeGenC::GetFunctionName(const GlobalVar& gvar) {
+  auto it = internal_functions_.find(gvar);
+  ICHECK(it != internal_functions_.end())
+      << "Attempted to find name of " << gvar
+      << ", but no function with this GlobalVar has been declared";
+  return it->second;
+}
+
+void CodeGenC::AddFunction(const GlobalVar& gvar, const PrimFunc& f) {
+  // If the function has already been forward-declared, this is a
+  // no-op.
+  DeclareFunction(gvar, f);
+  auto function_name = GetFunctionName(gvar);
+
+  // clear previous generated state.
+  InitFuncState(f);
+
+  PrintFunctionSignature(function_name, f, stream);
+  stream << " {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
   this->PrintStmt(f->body);
-  this->PrintFinalReturn();
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
 }
 
-void CodeGenC::PrintFuncPrefix() { stream << "void"; }
+void CodeGenC::PrintFuncPrefix(std::ostream& os) {}
 
-void CodeGenC::PrintExtraAttrs(const PrimFunc& f) {}
+void CodeGenC::PrintExtraAttrs(const PrimFunc& f, std::ostream& os) {}
 
-void CodeGenC::PrintFinalReturn() {}
-
-std::string CodeGenC::Finish() { return decl_stream.str() + stream.str(); }
+std::string CodeGenC::Finish() {
+  std::ostringstream code;
+  code << decl_stream.str();
+  code << fwd_decl_stream.str();
+  code << stream.str();
+  return code.str();
+}
 
 void CodeGenC::PrintExpr(const PrimExpr& n, std::ostream& os) {  // NOLINT(*)
   if (print_ssa_form_) {
@@ -323,6 +370,10 @@ void CodeGenC::PrintVecStore(const BufferNode* buffer, DataType t, PrimExpr base
   std::string ref = GetBufferRef(t, buffer, base);
   this->PrintIndent();
   stream << ref << " = " << value << ";\n";
+}
+
+void CodeGenC::PrintVecConstructor(DataType t, std::ostream& os) {  // NOLINT(*)
+  PrintType(t, os);
 }
 
 std::string CodeGenC::CastFromTo(std::string value, DataType from, DataType target) {
@@ -525,8 +576,8 @@ void CodeGenC::PrintCallExtern(Type ret_type, String global_symbol, const Array<
 }
 
 void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
-  if (auto* ptr_op = op->op.as<OpNode>()) {
-    auto call_op = GetRef<Op>(ptr_op);
+  if (auto opt_call_op = op->op.as<Op>()) {
+    auto call_op = opt_call_op.value();
 
     if (op->op.same_as(builtin::tvm_check_return())) {
       const CallNode* call = op->args[2].as<CallNode>();
@@ -536,10 +587,24 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
       PrintExpr(op->args[0], os);
       os << " ) return ";
       PrintExpr(op->args[1], os);
+    } else if (op->op.same_as(builtin::ret())) {
+      os << "return ";
+      PrintExpr(op->args[0], os);
     } else if (op->op.same_as(builtin_call_extern_) || op->op.same_as(builtin_call_pure_extern_)) {
       ICHECK_GE(op->args.size(), 1U);
       auto func = Downcast<StringImm>(op->args[0]);
       this->PrintCallExtern(GetType(GetRef<PrimExpr>(op)), func->value, op->args, true, os);
+
+      // If the call_extern refers to an function within the IRModule, then
+      // the forward declaration is already provided from DeclareFunction.
+      if (!func_name_supply_->ContainsName(func->value)) {
+        Array<Type> arg_types;
+        for (size_t i = 1; i < op->args.size(); i++) {
+          arg_types.push_back(GetType(op->args[i]));
+        }
+        Type ret_type = GetTypeFromRuntimeDataType(op->dtype);
+        this->GenerateForwardFunctionDeclarations(func->value, arg_types, ret_type);
+      }
     } else if (op_attr_global_symbol_.count(call_op)) {
       // call extern if the op itself have a global symbol.
       this->PrintCallExtern(GetType(GetRef<PrimExpr>(op)), op_attr_global_symbol_[call_op],
@@ -566,13 +631,33 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
     } else if (op->op.same_as(builtin::shift_right())) {
       PrintBinaryIntrinsic(op, " >> ", os, this);
     } else if (op->op.same_as(builtin::if_then_else())) {
-      os << "(";
-      PrintExpr(op->args[0], os);
-      os << " ? ";
-      PrintExpr(op->args[1], os);
-      os << " : ";
-      PrintExpr(op->args[2], os);
-      os << ")";
+      // conditional that skips eval if cond evals to false
+      std::string result = name_supply_->FreshName("condval");
+      std::string cond = PrintExpr(op->args[0]);
+      this->PrintIndent();
+      PrintType(op->dtype, this->stream);
+      this->stream << " " << result << ";\n";
+      this->PrintIndent();
+      this->stream << "if (" << cond << ") {\n";
+      {
+        int then_scope = this->BeginScope();
+        std::string true_val = PrintExpr(op->args[1]);
+        this->PrintIndent();
+        this->stream << result << " = " << true_val << ";\n";
+        this->EndScope(then_scope);
+        this->PrintIndent();
+        this->stream << "} else {\n";
+      }
+      {
+        int else_scope = this->BeginScope();
+        std::string false_val = PrintExpr(op->args[2]);
+        this->PrintIndent();
+        this->stream << result << " = " << false_val << ";\n";
+        this->EndScope(else_scope);
+        this->PrintIndent();
+        this->stream << "}\n";
+      }
+      os << result;
     } else if (op->op.same_as(builtin::address_of())) {
       const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
       ICHECK(op->args.size() == 1 && load);
@@ -587,10 +672,15 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
       this->PrintExpr(op->args[0], os);
       os << " == NULL)";
     } else if (op->op.same_as(builtin::reinterpret())) {
+      auto target_dtype = op->dtype;
+      auto source_dtype = op->args[0]->dtype;
+      CHECK_EQ(target_dtype.lanes() * target_dtype.bits(),
+               source_dtype.lanes() * source_dtype.bits())
+          << "reinterpret expects source and target to have the same number of bits";
       int ssa_scope = BeginScope();
-      std::string rhs = SSAGetID(PrintExpr(op->args[0]), op->args[0]->dtype);
+      std::string rhs = SSAGetID(PrintExpr(op->args[0]), source_dtype);
       os << "(*(";
-      this->PrintType(op->dtype, os);
+      this->PrintType(target_dtype, os);
       os << " *)(&(" << rhs << ")))";
       EndScope(ssa_scope);
     } else if (op->op.same_as(builtin::isnan())) {
@@ -604,12 +694,20 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
       const StringImmNode* str = op->args[0].as<StringImmNode>();
       ICHECK(str != nullptr);
       os << "__tvm_param__" << str->value;
+    } else if (op->op.same_as(builtin::tvm_thread_invariant())) {
+      os << "(";
+      this->PrintExpr(op->args[0], os);
+      os << ")";
     } else {
       LOG(FATAL) << "Unresolved call " << op->op;
     }
+  } else if (auto opt = op->op.as<GlobalVar>()) {
+    auto gvar = opt.value();
+    auto callee_name = GetFunctionName(gvar);
+    PrintCallExtern(GetType(GetRef<PrimExpr>(op)), callee_name, op->args, false, os);
   } else {
-    ICHECK(op->op.as<GlobalVarNode>());
-    LOG(FATAL) << "Do not yet support cross function call";
+    LOG(FATAL) << "CodeGenC: Unknown operation " << op->op << " is neither a recognized built-in, "
+               << "nor a GlobalVar reference to another function in the IRModule";
   }
 }
 
@@ -631,7 +729,8 @@ void CodeGenC::PrintVecBinaryOp(const std::string& op, DataType t, PrimExpr lhs,
 }
 
 void CodeGenC::VisitStmt_(const AllocateConstNode* op) {
-  std::string symbol_name = op->buffer_var->name_hint;
+  std::string symbol_name = AllocVarID(op->buffer_var.get());
+
   int64_t num_elements = 1;
   const auto& data = op->data.value();
 
@@ -663,12 +762,9 @@ void CodeGenC::VisitStmt_(const AllocateConstNode* op) {
 
 void CodeGenC::VisitStmt_(const DeclBufferNode* op) { this->PrintStmt(op->body); }
 
-void CodeGenC::VisitExpr_(const LoadNode* op, std::ostream& os) {  // NOLINT(*)
-  LOG(FATAL) << "Unexpected deprecated LoadNode.  Use BufferLoadNode instead.";
-}
-
 void CodeGenC::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLINT(*)
   ICHECK_EQ(op->indices.size(), 1) << "Load from non-flat memory not supported.";
+  ICHECK(!op->predicate.defined()) << "Predicated buffer load is not supported.";
 
   DataType value_dtype = op->dtype;
   PrimExpr index = op->indices[0];
@@ -726,12 +822,9 @@ void CodeGenC::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLI
   }
 }
 
-void CodeGenC::VisitStmt_(const StoreNode* op) {
-  LOG(FATAL) << "Unexpected deprecated StoreNode.  Use BufferStoreNode instead.";
-}
-
 void CodeGenC::VisitStmt_(const BufferStoreNode* op) {
   ICHECK_EQ(op->indices.size(), 1) << "Store to non-flat memory not supported.";
+  ICHECK(!op->predicate.defined()) << "Predicated buffer store is not supported.";
 
   DataType value_dtype = op->value.dtype();
   DataType element_dtype = op->buffer->dtype;
@@ -794,24 +887,86 @@ void CodeGenC::VisitExpr_(const LetNode* op, std::ostream& os) {  // NOLINT(*)
     let_binding_[op->var] = op;
   }
   std::string value = PrintExpr(op->value);
-  var_idmap_[op->var.get()] = value;
+  if (print_ssa_form_) {
+    ICHECK(!var_idmap_.count(op->var.get()));
+    var_idmap_[op->var.get()] = value;
+  } else {
+    PrintIndent();
+    if (op->var.dtype() == DataType::Handle() && handle_data_type_.count(op->var.get())) {
+      PrintType(handle_data_type_.at(op->var.get()), this->stream);
+      this->stream << "* " << AllocVarID(op->var.get()) << " = (";
+      PrintType(handle_data_type_.at(op->var.get()), this->stream);
+      this->stream << "*)" << value << ";\n";
+    } else {
+      PrintType(op->var.dtype(), this->stream);
+      this->stream << ' ' << AllocVarID(op->var.get()) << " = " << value << ";\n";
+    }
+  }
   os << PrintExpr(op->body);
+  // Pop the defined var from var_idmap when exiting its scope.
+  // We do this because it is hard to completely avoid a same LetNode appearing
+  // at different places.
+  bool removed = var_idmap_.erase(op->var.get());
+  ICHECK(removed);
 }
 
 void CodeGenC::VisitExpr_(const RampNode* op, std::ostream& os) {  // NOLINT(*)
-  // constraint of current logic
-  ICHECK_EQ(op->base.dtype(), DataType::Int(32));
-  os << "((int" << op->lanes << ")(";
-  for (int i = 0; i < op->lanes; i++) {
+  // NOTE: C have comma expression so cannot use (int2)(v0, v1)
+  // instead should use int2(v0, v1)
+  PrintType(op->dtype, os);
+  int lanes = op->dtype.lanes();
+  os << "(";
+  for (int i = 0; i < lanes; i++) {
     os << "(" << PrintExpr(op->base) << ")"
        << "+(" << PrintExpr(op->stride) << "*" << i << ")";
-    if (i != op->lanes - 1) os << ", ";
+    if (i != lanes - 1) os << ", ";
   }
-  os << "))";
+  os << ")";
 }
 
-void CodeGenC::VisitExpr_(const ShuffleNode* op, std::ostream& os) {
-  LOG(FATAL) << "Shuffle: not supported ";
+void CodeGenC::VisitExpr_(const ShuffleNode* op, std::ostream& os) {  // NOLINT(*)
+  // Shuffle support
+  // vec = concat(vectors)
+  // result = (vec[indices[0]], vec[indices[1]], ...)
+  //
+  // print shuffle as:
+  // target_dtype(e0, e1, e2, .. en)
+
+  // construct the concat
+  std::vector<std::string> concat_vec;
+  // NOTE: important to print expr first
+  // in case each expr have their own nested expressions
+  // print each elements
+  for (const PrimExpr& vec : op->vectors) {
+    std::string vec_value = this->PrintExpr(vec);
+    if (vec.dtype().lanes() == 1) {
+      concat_vec.push_back(vec_value);
+    } else {
+      // print out each element
+      for (int i = 0; i < vec.dtype().lanes(); ++i) {
+        // access i-th element of each vector
+        std::ostringstream vec_elem_strm;
+        vec_elem_strm << vec_value << "[" << i << "]";
+        concat_vec.push_back(vec_elem_strm.str());
+      }
+    }
+  }
+  if (op->indices.size() == 1) {
+    // This is an extract element
+    int64_t idx = Downcast<IntImm>(op->indices[0])->value;
+    ICHECK_LT(idx, concat_vec.size());
+    os << concat_vec[idx];
+  } else {
+    // Print the shuffle as vector constructor
+    // vec(e0, e1, e2, .. en)
+    PrintVecConstructor(op->dtype, os);
+    os << '(';
+    for (size_t i = 0; i < op->indices.size(); ++i) {
+      if (i != 0) os << ", ";
+      os << concat_vec[Downcast<IntImm>(op->indices[i])->value];
+    }
+    os << ')';
+  }
 }
 
 void CodeGenC::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NOLINT(*)
@@ -916,8 +1071,11 @@ void CodeGenC::VisitStmt_(const ForNode* op) {
 
 void CodeGenC::VisitStmt_(const WhileNode* op) {
   PrintIndent();
-  stream << "while (" << PrintExpr(op->condition) << ") {\n";
+  stream << "while (1) {\n";
   int while_scope = BeginScope();
+  std::string cond = PrintExpr(op->condition);
+  PrintIndent();
+  stream << "if (!(" << cond << ")) { break; }\n";
   PrintStmt(op->body);
   this->EndScope(while_scope);
   PrintIndent();
@@ -936,11 +1094,11 @@ void CodeGenC::VisitStmt_(const IfThenElseNode* op) {
   PrintStmt(op->then_case);
   this->EndScope(then_scope);
 
-  if (op->else_case.defined()) {
+  if (op->else_case) {
     PrintIndent();
     stream << "} else {\n";
     int else_scope = BeginScope();
-    PrintStmt(op->else_case);
+    PrintStmt(op->else_case.value());
     this->EndScope(else_scope);
   }
   PrintIndent();
@@ -996,9 +1154,11 @@ void CodeGenC::PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
   }
 
   if (i == 0) {
-    os << "((";
+    // NOTE: C have comma expression so cannot use (float2)(v0, v1)
+    // instead should use float2(v0, v1)
+    os << "(";
     PrintType(t, os);
-    os << ")(";
+    os << "(";
   }
   os << value;
   if (i != t.lanes() - 1) {

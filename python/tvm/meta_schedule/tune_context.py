@@ -24,10 +24,11 @@ from typing_extensions import Literal
 # isort: on
 
 from tvm import IRModule
-from tvm._ffi import register_object
+from tvm._ffi import register_object, register_func
 from tvm.runtime import Object
 from tvm.target import Target
 from tvm.tir import PrimFunc, Schedule
+from tvm.script import tir as T
 
 from . import _ffi_api
 from .logging import Logger, get_logger, get_logging_func
@@ -41,11 +42,13 @@ if TYPE_CHECKING:
     from .space_generator import SpaceGenerator
 
 
+@register_func("tvm.meta_schedule.normalize_mod")
 def _normalize_mod(mod: Union[PrimFunc, IRModule]) -> IRModule:
     """Normalize the input to an IRModule"""
     if isinstance(mod, PrimFunc):
-        mod = mod.with_attr("global_symbol", "main")
-        mod = mod.with_attr("tir.noalias", True)
+        if not (mod.attrs and "global_symbol" in mod.attrs):
+            mod = mod.with_attr("global_symbol", "main")
+        mod = mod.with_attr("tir.noalias", T.bool(True))
         mod = IRModule({"main": mod})
     if not isinstance(mod, IRModule):
         raise TypeError(f"Expected `mod` to be PrimFunc or IRModule, but gets: {mod}")
@@ -153,7 +156,7 @@ class TuneContext(Object):
 
         Returns
         -------
-        design_spaces : List[Schedule]
+        design_spaces : List[tvm.tir.Schedule]
             The generated design spaces, i.e., schedules.
         """
         if self.mod is None:
@@ -183,7 +186,7 @@ class TuneContext(Object):
             The maximum number of trials to be executed.
         num_trials_per_iter : int = 64
             The number of trials to be executed per iteration.
-        design_spaces : Optional[List[Schedule]]
+        design_spaces : Optional[List[tvm.tir.Schedule]]
             The design spaces used during tuning process.
             If None, use the outcome of `self.generate_design_space()`.
         database : Optional[Database] = None

@@ -100,6 +100,14 @@ class ScheduleRule : public runtime::ObjectRef {
    */
   using FClone = runtime::TypedPackedFunc<ScheduleRule()>;
   /*!
+   * \brief Create a rule that applies customized rules registered using block attribute
+   * `schedule_rule`. The rule will be dispatched according to target keys.
+   * \return The created schedule rule.
+   */
+  TVM_DLL static ScheduleRule ApplyCustomRule();
+  /*! \brief Check if the rule is `ApplyCustomRule` */
+  TVM_DLL static bool IsApplyCustomRule(const ScheduleRule& rule);
+  /*!
    * \brief Create an auto-inline rule that inlines spatial blocks if it satisfies some conditions
    * \param into_producer If allows to inline a block into its producer
    * \param into_consumer If allows to inline a block into its consumer
@@ -117,6 +125,16 @@ class ScheduleRule : public runtime::ObjectRef {
                                          bool require_injective,      //
                                          bool require_ordered,        //
                                          Optional<Array<String>> disallow_op);
+
+  /*!
+   * \brief Inline blocks that produce a constant scalar. Such blocks get in the way of
+   * ReverseComputeInline during AutoInline, since they are also counted as a producer block
+   * unless they are inlined first. So it is recommended to run InlineConstantScalars before
+   * AutoInline.
+   * \return The schedule rule created
+   */
+  TVM_DLL static ScheduleRule InlineConstantScalars();
+
   /*!
    * \brief Create a mega rule: multi-level tiling with data reuse
    * \param structure The tiling structure. Recommended:
@@ -130,6 +148,10 @@ class ScheduleRule : public runtime::ObjectRef {
    * NullOpt means disable vectorization
    * \param reuse_read Data reuse configuration for reading. NullOpt means no reuse.
    * \param reuse_write Data reuse configuration for writing. NullOpt means no reuse.
+   * \param filter_fn A function that can be passed to overwrite the default condition for applying
+   * MultiLevelTiling to a block. Its signature must be (Schedule, BlockRV) -> bool.
+   * This is useful if there is a need to apply MultiLevelTiling to an operation / block which is
+   * ignored  by default. This function should return True for a block that should be tiled.
    * \return The schedule rule created
    */
   TVM_DLL static ScheduleRule MultiLevelTiling(String structure,                             //
@@ -137,7 +159,8 @@ class ScheduleRule : public runtime::ObjectRef {
                                                Optional<Integer> max_innermost_factor,       //
                                                Optional<Array<Integer>> vector_load_lens,    //
                                                Optional<Map<String, ObjectRef>> reuse_read,  //
-                                               Optional<Map<String, ObjectRef>> reuse_write);
+                                               Optional<Map<String, ObjectRef>> reuse_write,
+                                               Optional<runtime::PackedFunc> filter_fn = NullOpt);
 
   /*!
    * \brief Extension of MultiLevelTiling for auto-tensorization with a single intrinsic.
@@ -218,7 +241,7 @@ class ScheduleRule : public runtime::ObjectRef {
    * \param thread_extents Candidates of thread axis extent (values are required to be positive).
    * \return The schedule rule created
    */
-  TVM_DLL static ScheduleRule CrossThreadReduction(Array<Integer> thread_extents);
+  TVM_DLL static ScheduleRule CrossThreadReduction(Array<runtime::Int> thread_extents);
   /*!
    * \brief A rule that randomly select a compute-at location for a free block
    * \return The schedule rule created
@@ -237,17 +260,20 @@ class ScheduleRule : public runtime::ObjectRef {
    * \param unroll_explicit Whether to explicitly unroll the loop, or just add an "unroll" pragma.
    * \return The schedule rule created
    */
-  TVM_DLL static ScheduleRule ParallelizeVectorizeUnroll(int max_jobs_per_core,            //
-                                                         int max_vectorize_extent,         //
-                                                         Array<Integer> unroll_max_steps,  //
+  TVM_DLL static ScheduleRule ParallelizeVectorizeUnroll(int max_jobs_per_core,                 //
+                                                         int max_vectorize_extent,              //
+                                                         Array<runtime::Int> unroll_max_steps,  //
                                                          bool unroll_explicit);
   /*!
    * \brief Auto bind loops around the block to BlockIdx and ThreadIdx
    * \param max_threadblocks The maximum number of threadblock on GPU
    * \param thread_extents Candidates of thread axis extent.
+   * \param max_threads_per_block The maximum number of threads per block, if it is known
+   * when this schedule rule is created.
    * \return The schedule rule created
    */
-  TVM_DLL static ScheduleRule AutoBind(int max_threadblocks, Array<Integer> thread_extents);
+  TVM_DLL static ScheduleRule AutoBind(int max_threadblocks, Array<Integer> thread_extents,
+                                       int max_threads_per_block = -1);
   /*!
    * \brief Create a schedule rule with customized methods on the python-side.
    * \param f_initialize_with_tune_context The packed function of `InitializeWithTuneContext`.
@@ -264,12 +290,16 @@ class ScheduleRule : public runtime::ObjectRef {
 
   /*! \brief Create default schedule rules for LLVM */
   TVM_DLL static Array<ScheduleRule, void> DefaultLLVM();
+  /*! \brief Create default schedule rules for x86 (AVX512 and VNNI) */
+  TVM_DLL static Array<ScheduleRule, void> DefaultX86(const String& type);
   /*! \brief Create default schedule rules for CUDA */
   TVM_DLL static Array<ScheduleRule, void> DefaultCUDA();
   /*! \brief Create default postprocessors for CUDA with TensorCore */
   TVM_DLL static Array<ScheduleRule, void> DefaultCUDATensorCore();
   /*! \brief Create default schedule rules for Hexagon */
   TVM_DLL static Array<ScheduleRule, void> DefaultHexagon();
+  /*! \brief Create default schedule rules for ARM CPU (NEON and DOTPROD) */
+  TVM_DLL static Array<ScheduleRule, void> DefaultARM(const String& type);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(ScheduleRule, ObjectRef, ScheduleRuleNode);
 };

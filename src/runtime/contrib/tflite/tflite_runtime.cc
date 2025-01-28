@@ -86,7 +86,6 @@ DataType TfLiteDType2TVMDType(TfLiteType dtype) {
       return DataType::Float(16);
     default:
       LOG(FATAL) << "tflite data type not support yet: " << dtype;
-      return DataType::Float(32);
   }
 }
 
@@ -151,8 +150,7 @@ NDArray TFLiteRuntime::GetOutput(int index) const {
   return ret;
 }
 
-PackedFunc TFLiteRuntime::GetFunction(const std::string& name,
-                                      const ObjectPtr<Object>& sptr_to_self) {
+PackedFunc TFLiteRuntime::GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) {
   // Return member functions during query.
   if (name == "set_input") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {

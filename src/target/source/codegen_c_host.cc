@@ -24,7 +24,6 @@
 
 #include <tvm/relay/executor.h>
 #include <tvm/relay/runtime.h>
-#include <tvm/runtime/crt/error_codes.h>
 #include <tvm/runtime/module.h>
 #include <tvm/target/codegen.h>
 
@@ -44,26 +43,17 @@ namespace codegen {
 
 CodeGenCHost::CodeGenCHost() { module_name_ = name_supply_->FreshName("__tvm_module_ctx"); }
 
-void CodeGenCHost::Init(bool output_ssa, bool emit_asserts, std::string target_str,
-                        const std::unordered_set<std::string>& devices) {
+void CodeGenCHost::Init(bool output_ssa, bool emit_asserts, bool emit_fwd_func_decl,
+                        std::string target_str, const std::unordered_set<std::string>& devices) {
   emit_asserts_ = emit_asserts;
+  emit_fwd_func_decl_ = emit_fwd_func_decl;
   declared_globals_.clear();
   decl_stream << "// tvm target: " << target_str << "\n";
   decl_stream << "#define TVM_EXPORTS\n";
   decl_stream << "#include \"tvm/runtime/c_runtime_api.h\"\n";
   decl_stream << "#include \"tvm/runtime/c_backend_api.h\"\n";
   decl_stream << "#include <math.h>\n";
-  if (devices.find("ethos-u") != devices.end()) {
-    decl_stream << "#include <tvm_ethosu_runtime.h>\n";
-  }
-  if (devices.find("cmsis-nn") != devices.end()) {
-    decl_stream << "#include <stdio.h>\n";
-    decl_stream << "#include <stdlib.h>\n";
-    decl_stream << "#include <dlpack/dlpack.h>\n";
-    decl_stream << "#include <arm_nnfunctions.h>\n";
-    decl_stream << "#include <arm_nn_types.h>\n";
-    decl_stream << "#include <arm_nn_math_types.h>\n";
-  }
+  decl_stream << "#include <stdbool.h>\n";
   CodeGenC::Init(output_ssa);
 }
 
@@ -73,17 +63,28 @@ void CodeGenCHost::InitGlobalContext() {
 
 void CodeGenCHost::DefineModuleName() { decl_stream << "void* " << module_name_ << " = NULL;\n"; }
 
-void CodeGenCHost::AddFunction(const PrimFunc& f) {
-  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.defined())
-      << "CodeGenCHost: Expect PrimFunc to have the global_symbol attribute";
-  function_names_.push_back(global_symbol.value());
+void CodeGenCHost::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
+  return AddFunction(gvar, func, /*emit_fwd_func_decl=*/false);
+}
 
-  CodeGenC::AddFunction(f);
-  if (f->HasNonzeroAttr(tir::attr::kIsEntryFunc)) {
+void CodeGenCHost::AddFunction(const GlobalVar& gvar, const PrimFunc& func,
+                               bool emit_fwd_func_decl) {
+  auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
+  if (global_symbol) {
+    function_names_.push_back(global_symbol.value());
+  }
+
+  emit_fwd_func_decl_ = emit_fwd_func_decl;
+  CodeGenC::AddFunction(gvar, func);
+  if (func->HasNonzeroAttr(tir::attr::kIsEntryFunc)) {
+    ICHECK(global_symbol.defined())
+        << "CodeGenCHost: The entry func must have the global_symbol attribute, "
+        << "but function " << gvar << " only has attributes " << func->attrs;
+
     function_names_.push_back(runtime::symbol::tvm_module_main);
     stream << "// CodegenC: NOTE: Auto-generated entry function\n";
-    PrintFuncPrefix();
+    PrintFuncPrefix(stream);
+    PrintType(func->ret_type, stream);
     stream << " " << tvm::runtime::symbol::tvm_module_main
            << "(void* args, int* arg_type_ids, int num_args, void* out_ret_value, "
            << "int* out_ret_tcode, void* resource_handle) {\n";
@@ -93,16 +94,35 @@ void CodeGenCHost::AddFunction(const PrimFunc& f) {
   }
 }
 
-void CodeGenCHost::PrintFuncPrefix() {  // NOLINT(*)
-  stream << "#ifdef __cplusplus\n"
-         << "extern \"C\"\n"
-         << "#endif\n"
-         << "TVM_DLL int32_t";
+void CodeGenCHost::GenerateForwardFunctionDeclarations(String global_symbol,
+
+                                                       const Array<Type>& arg_types,
+                                                       const Type& ret_type) {
+  if (!emit_fwd_func_decl_) {
+    return;
+  }
+  for (auto& func_already_defined : GetFunctionNames()) {
+    if (global_symbol == func_already_defined) {
+      return;
+    }
+  }
+  this->PrintFuncPrefix(fwd_decl_stream);
+  this->PrintType(ret_type, fwd_decl_stream);
+  fwd_decl_stream << " " << global_symbol << "(";
+  for (size_t i = 0; i < arg_types.size(); ++i) {
+    if (i > 0) {
+      fwd_decl_stream << ", ";
+    }
+    CodeGenSourceBase::PrintType(arg_types[i], fwd_decl_stream);
+  }
+  fwd_decl_stream << ");\n";
 }
 
-void CodeGenCHost::PrintFinalReturn() {  // NOLINT(*)
-  this->PrintIndent();
-  stream << "return 0;\n";
+void CodeGenCHost::PrintFuncPrefix(std::ostream& os) {  // NOLINT(*)
+  os << "#ifdef __cplusplus\n"
+     << "extern \"C\"\n"
+     << "#endif\n"
+     << "TVM_DLL ";
 }
 
 void CodeGenCHost::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
@@ -176,10 +196,11 @@ void CodeGenCHost::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
 
 void CodeGenCHost::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NOLINT(*)
   std::string v = PrintExpr(op->value);
+  int lanes = op->dtype.lanes();
   os << "((";
   PrintType(op->dtype, os);
   os << ")(";
-  for (int i = 0; i < op->lanes; ++i) {
+  for (int i = 0; i < lanes; ++i) {
     if (i != 0) os << ", ";
     os << v;
   }
@@ -391,6 +412,7 @@ runtime::Module BuildCHost(IRModule mod, Target target) {
   using tvm::runtime::Registry;
   bool output_ssa = false;
   bool emit_asserts = false;
+  bool emit_fwd_func_decl = true;
 
   std::unordered_set<std::string> devices;
   if (mod->GetAttr<Map<GlobalVar, String>>("device_contexts") != nullptr) {
@@ -402,43 +424,40 @@ runtime::Module BuildCHost(IRModule mod, Target target) {
   }
 
   CodeGenCHost cg;
-  cg.Init(output_ssa, emit_asserts, target->str(), devices);
+  cg.Init(output_ssa, emit_asserts, emit_fwd_func_decl, target->str(), devices);
   cg.SetConstantsByteAlignment(target->GetAttr<Integer>("constants-byte-alignment").value_or(16));
-  PrimFunc aot_executor_fn;
 
-  std::vector<std::pair<tvm::GlobalVar, tvm::BaseFunc>> funcs;
-  for (auto kv : mod->functions) {
-    // Make sure that the executor function is the last one to be code generated so that all the
-    // symbols are available to __tvm_main__
-    auto fun_name = std::string(kv.first->name_hint);
-    bool is_aot_executor_fn = kv.second->GetAttr<Bool>("runner_function", Bool(false)).value();
+  auto is_aot_executor_fn = [](const PrimFunc& func) -> bool {
+    return func->GetAttr<Bool>("runner_function", Bool(false)).value();
+  };
 
-    if (is_aot_executor_fn) {
-      aot_executor_fn = Downcast<PrimFunc>(kv.second);
-      continue;
-    }
-    funcs.push_back(kv);
+  std::vector<std::pair<GlobalVar, PrimFunc>> funcs;
+  for (auto [gvar, base_func] : mod->functions) {
+    ICHECK(base_func->IsInstance<PrimFuncNode>()) << "CodegenCHost: Can only take PrimFunc";
+    auto prim_func = Downcast<PrimFunc>(base_func);
+    funcs.push_back({gvar, prim_func});
   }
 
   // Sort functions
-  std::sort(funcs.begin(), funcs.end(),
-            [](std::pair<tvm::GlobalVar, tvm::BaseFunc> kv_a,
-               std::pair<tvm::GlobalVar, tvm::BaseFunc> kv_b) {
-              std::string name_hint_a = kv_a.first->name_hint;
-              std::string name_hint_b = kv_b.first->name_hint;
-              return name_hint_a < name_hint_b;
-            });
+  auto sort_key = [&is_aot_executor_fn](const auto& kv) {
+    return std::tuple{is_aot_executor_fn(kv.second), kv.first->name_hint};
+  };
+  std::sort(funcs.begin(), funcs.end(), [&sort_key](const auto& kv_a, const auto& kv_b) {
+    return sort_key(kv_a) < sort_key(kv_b);
+  });
 
-  // Add all functions except __tvm_main__
-  for (auto& kv : funcs) {
-    ICHECK(kv.second->IsInstance<PrimFuncNode>()) << "CodegenCHost: Can only take PrimFunc";
-    auto f = Downcast<PrimFunc>(kv.second);
-    cg.AddFunction(f);
+  // Declare all functions first.  This ensures that all functions,
+  // including the __tvm_main__ used in AOT, have access to forward
+  // declarations of other functions in the IRModule.
+  for (const auto& [gvar, prim_func] : funcs) {
+    cg.DeclareFunction(gvar, prim_func);
   }
 
-  // Add __tvm_main__
-  if (aot_executor_fn.defined()) {
-    cg.AddFunction(aot_executor_fn);
+  // Codegen all functions.  Passing emit_fwd_func_decl=true adds a
+  // forward declaration for any `builtin::call_extern`, based on the
+  // arguments provided to it.
+  for (const auto& [gvar, prim_func] : funcs) {
+    cg.AddFunction(gvar, prim_func, emit_fwd_func_decl);
   }
 
   // NOTE: it's possible that kRuntime attr is not attached when the mod was built with tvm.build().
@@ -450,7 +469,10 @@ runtime::Module BuildCHost(IRModule mod, Target target) {
   } else {
     runtime = relay::Runtime::Create("cpp", {});
   }
-  if (aot_executor_fn.defined() && runtime->name == relay::kTvmRuntimeCpp) {
+
+  bool has_aot_executor_fn = std::any_of(
+      funcs.begin(), funcs.end(), [&](const auto& kv) { return is_aot_executor_fn(kv.second); });
+  if (has_aot_executor_fn && runtime->name == relay::kTvmRuntimeCpp) {
     cg.InitGlobalContext();
   }
 

@@ -90,7 +90,6 @@ class StmtFunctor<R(const Stmt& n, Args... args)> {
   virtual R VisitStmt_(const AllocateNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
   virtual R VisitStmt_(const AllocateConstNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
   virtual R VisitStmt_(const DeclBufferNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
-  virtual R VisitStmt_(const StoreNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
   virtual R VisitStmt_(const BufferStoreNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
   virtual R VisitStmt_(const BufferRealizeNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
   virtual R VisitStmt_(const AssertStmtNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
@@ -103,7 +102,6 @@ class StmtFunctor<R(const Stmt& n, Args... args)> {
   virtual R VisitStmt_(const BlockRealizeNode* op, Args... args) STMT_FUNCTOR_DEFAULT;
   virtual R VisitStmtDefault_(const Object* op, Args...) {
     LOG(FATAL) << "Do not have a default for " << op->GetTypeKey();
-    return R();
   }
 
  private:
@@ -118,7 +116,6 @@ class StmtFunctor<R(const Stmt& n, Args... args)> {
     IR_STMT_FUNCTOR_DISPATCH(AllocateNode);
     IR_STMT_FUNCTOR_DISPATCH(AllocateConstNode);
     IR_STMT_FUNCTOR_DISPATCH(DeclBufferNode);
-    IR_STMT_FUNCTOR_DISPATCH(StoreNode);
     IR_STMT_FUNCTOR_DISPATCH(AssertStmtNode);
     IR_STMT_FUNCTOR_DISPATCH(ProducerStoreNode);
     IR_STMT_FUNCTOR_DISPATCH(ProducerRealizeNode);
@@ -162,7 +159,6 @@ class TVM_DLL StmtVisitor : protected StmtFunctor<void(const Stmt&)> {
   void VisitStmt_(const AllocateNode* op) override;
   void VisitStmt_(const AllocateConstNode* op) override;
   void VisitStmt_(const DeclBufferNode* op) override;
-  void VisitStmt_(const StoreNode* op) override;
   void VisitStmt_(const BufferStoreNode* op) override;
   void VisitStmt_(const BufferRealizeNode* op) override;
   void VisitStmt_(const AssertStmtNode* op) override;
@@ -264,7 +260,6 @@ class TVM_DLL StmtMutator : protected StmtFunctor<Stmt(const Stmt&)> {
   Stmt VisitStmt_(const AllocateNode* op) override;
   Stmt VisitStmt_(const AllocateConstNode* op) override;
   Stmt VisitStmt_(const DeclBufferNode* op) override;
-  Stmt VisitStmt_(const StoreNode* op) override;
   Stmt VisitStmt_(const BufferStoreNode* op) override;
   Stmt VisitStmt_(const BufferRealizeNode* op) override;
   Stmt VisitStmt_(const AssertStmtNode* op) override;
@@ -369,45 +364,161 @@ TVM_DLL PrimExpr Substitute(PrimExpr expr, std::function<Optional<PrimExpr>(cons
 
 /*!
  * \brief Substitute the var specified by vmap.
- * \param region The object whose vars are to be substituted
- * \param vmap The map of new values.
+ * \param arr The array of Stmt/PrimExpr to be substituted
+ * \param vmap returns a new value if re-mapping is needed, otherwise returns nullptr.
  * \return The result.
- */
-TVM_DLL Array<Range> Substitute(const Array<Range>& region, const Map<Var, PrimExpr>& vmap);
-
-/*!
- * \brief Sugar for substitute via a given map.
- * \param input The input to be updated.
- * \param value_map The map of new values.
- * \return The result.
- * \tparam T the input type, can be PrimExpr or Stmt.
  */
 template <typename T>
-inline auto Substitute(T input, const Map<Var, PrimExpr>& value_map) {
-  auto vmap = [&](const Var& var) -> Optional<PrimExpr> {
-    auto it = value_map.find(var);
-    if (it != value_map.end()) return (*it).second;
-    return Optional<PrimExpr>(nullptr);
-  };
-  return Substitute(std::move(input), vmap);
+Array<T> Substitute(const Array<T>& arr, std::function<Optional<PrimExpr>(const Var& var)> vmap) {
+  return arr.Map([&vmap](const auto& elem) { return Substitute(elem, vmap); });
 }
 
 /*!
- * \brief Sugar for substitute via a given map.
- * \param input The input to be updated.
- * \param value_map The map of new values.
- * \return The result.
- * \tparam T the input type, can be PrimExpr or Stmt.
+ * \brief Substitute the vars specified by vmap.
+ * \param range The array of Stmt/PrimExpr to be substituted
+ * \param vmap returns a new value if re-mapping is needed, otherwise returns nullptr.
+ * \return The modified Range.
  */
-template <typename T>
-inline T Substitute(T input, const std::unordered_map<const VarNode*, PrimExpr>& value_map) {
-  auto vmap = [&](const Var& var) -> Optional<PrimExpr> {
-    auto it = value_map.find(var.get());
-    if (it != value_map.end()) return (*it).second;
-    return Optional<PrimExpr>(nullptr);
-  };
-  return Substitute(std::move(input), vmap);
+inline Range Substitute(const Range& range,
+                        std::function<Optional<PrimExpr>(const Var& var)> vmap) {
+  return Range::FromMinExtent(Substitute(range->min, vmap), Substitute(range->extent, vmap));
 }
+
+/*!
+ * \brief Substitute the vars specified by vmap.
+ *
+ * Delegates to the Substitute methods that use std::function.  This
+ * overload allows braced-initialization of the Map, whereas the
+ * template<typename Expr> overload cannot.
+ *
+ * \param obj The object in which TIR variables should be substituted
+ * \param vmap Map defining the TIR variables to be replaced
+ * \return The modified object.
+ */
+template <typename Obj>
+auto Substitute(Obj&& obj, const Map<Var, PrimExpr>& vmap) {
+  auto func = [&vmap](const Var& var) -> Optional<PrimExpr> { return vmap.Get(var); };
+  return Substitute(std::forward<Obj>(obj), func);
+}
+
+/*!
+ * \brief Substitute the vars specified by vmap.
+ *
+ * Delegates to the Substitute methods that use std::function.
+ *
+ * \param obj The object in which TIR variables should be substituted
+ * \param vmap Map defining the TIR variables to be replaced
+ * \return The modified object.
+ */
+template <typename Obj, typename Expr,
+          typename = std::enable_if_t<std::is_base_of_v<PrimExpr, Expr>>>
+auto Substitute(Obj&& obj, const Map<Var, Expr>& vmap) {
+  auto func = [&vmap](const Var& var) -> Optional<PrimExpr> {
+    if (auto opt = vmap.Get(var)) {
+      return opt.value();
+    } else {
+      return NullOpt;
+    }
+  };
+  return Substitute(std::forward<Obj>(obj), func);
+}
+
+/*!
+ * \brief Substitute the vars specified by vmap.
+ *
+ * Delegates to the Substitute methods that use std::function.
+ *
+ * \param obj The object in which TIR variables should be substituted
+ * \param vmap Map defining the TIR variables to be replaced
+ * \return The modified object.
+ */
+template <typename Obj, typename Expr,
+          typename = std::enable_if_t<std::is_base_of_v<PrimExpr, Expr>>>
+auto Substitute(Obj&& obj, const std::unordered_map<const VarNode*, Expr>& vmap) {
+  auto func = [&vmap](const Var& var) -> Optional<PrimExpr> {
+    if (auto it = vmap.find(var.get()); it != vmap.end()) {
+      return it->second;
+    } else {
+      return NullOpt;
+    }
+  };
+  return Substitute(std::forward<Obj>(obj), func);
+}
+
+/*!
+ * \brief Substitute the vars specified by vmap.
+ *
+ * Delegates to the Substitute methods that use std::function.
+ *
+ * \param obj The object in which TIR variables should be substituted
+ * \param vmap Map defining the TIR variables to be replaced
+ * \return The modified object.
+ */
+template <typename Obj, typename Expr, typename Hasher, typename EqualityChecker,
+          typename = std::enable_if_t<std::is_base_of_v<PrimExpr, Expr>>>
+auto Substitute(Obj&& obj, const std::unordered_map<Var, Expr, Hasher, EqualityChecker>& vmap) {
+  auto func = [&vmap](const Var& var) -> Optional<PrimExpr> {
+    if (auto it = vmap.find(var); it != vmap.end()) {
+      return it->second;
+    } else {
+      return NullOpt;
+    }
+  };
+  return Substitute(std::forward<Obj>(obj), func);
+}
+
+/*!
+ * \brief Substitute the vars specified by vmap.
+ *
+ * Delegates to the Substitute methods that use std::function.
+ *
+ * \param obj The object in which TIR variables should be substituted
+ * \param iter_vmap Map defining the TIR variables to be replaced
+ * \return The modified object.
+ */
+template <typename Obj, typename Expr,
+          typename = std::enable_if_t<std::is_base_of_v<PrimExpr, Expr>>>
+auto Substitute(Obj&& obj, const std::unordered_map<IterVar, Expr>& iter_vmap) {
+  std::unordered_map<const VarNode*, PrimExpr> vmap;
+  for (const auto& [iter_var, expr] : iter_vmap) {
+    vmap[iter_var->var.get()] = expr;
+  }
+
+  auto func = [&vmap](const Var& var) -> Optional<PrimExpr> {
+    if (auto it = vmap.find(var.get()); it != vmap.end()) {
+      return it->second;
+    } else {
+      return NullOpt;
+    }
+  };
+  return Substitute(std::forward<Obj>(obj), func);
+}
+
+/*!
+ * \brief Substitute the var specified by vmap and legalize data types after substitution.
+ * \param stmt The source statement to be substituted
+ * \param vmap returns a new value if re-mapping is needed, otherwise returns nullptr.
+ *
+ * Unlike `Substitute`, this allows the substitution to change the data type of the expression.
+ *
+ * \sa Substitute
+ * \return The result.
+ */
+TVM_DLL Stmt SubstituteWithDataTypeLegalization(Stmt stmt,
+                                                std::function<Optional<PrimExpr>(const Var&)> vmap);
+
+/*!
+ * \brief Substitute the var specified by vmap and legalize data types after substitution.
+ * \param expr The source statement to be substituted
+ * \param vmap returns a new value if re-mapping is needed, otherwise returns nullptr.
+ *
+ * Unlike `Substitute`, this allows the substitution to change the data type of the expression.
+ *
+ * \sa Substitute
+ * \return The result.
+ */
+TVM_DLL PrimExpr SubstituteWithDataTypeLegalization(
+    PrimExpr expr, std::function<Optional<PrimExpr>(const Var&)> vmap);
 
 /*!
  * \brief Recursively visit the IR in pre DFS order node, apply fvisit.
@@ -458,57 +569,6 @@ bool ContainsNode(const Stmt& stmt) {
   visitor(stmt);
   return visitor.contains_node;
 }
-
-/*!
- * \brief Legalize the data types of expressions to make sure they are consistent with other
- * parts of the program.
- *
- * It enforces the following rules:
- * - The data type of the index variable in a loop must be consistent with the data type of the loop
- *  bounds.
- * - The data type of the binary and ternary expressions must be consistent with the data types of
- * each of their operands.
- * - The data type of the bounds and binding values of block iter vars must be consistent with the
- * data type of the block iter vars.
- *
- * Usually we enforce the consistency of data types when constructing the IR nodes. However, such
- * inconsistency may happen as a result of IR mutation in some passes. This class can be used as
- * base class of such passes to ensure the consistency of data types.
- */
-class DataTypeLegalizer : public StmtExprMutator {
- public:
-  Stmt VisitStmt_(const ForNode* op) override;
-
-  Stmt VisitStmt_(const AttrStmtNode* op) override;
-  Stmt VisitStmt_(const BlockRealizeNode* op) override;
-  Stmt VisitStmt_(const BlockNode* op) override;
-  PrimExpr VisitExpr_(const SelectNode* op) override;
-  PrimExpr VisitExpr_(const RampNode* op) override;
-  PrimExpr VisitExpr_(const AddNode* op) override;
-  PrimExpr VisitExpr_(const SubNode* op) override;
-  PrimExpr VisitExpr_(const MulNode* op) override;
-  PrimExpr VisitExpr_(const DivNode* op) override;
-  PrimExpr VisitExpr_(const ModNode* op) override;
-  PrimExpr VisitExpr_(const FloorDivNode* op) override;
-  PrimExpr VisitExpr_(const FloorModNode* op) override;
-  PrimExpr VisitExpr_(const MinNode* op) override;
-  PrimExpr VisitExpr_(const MaxNode* op) override;
-  PrimExpr VisitExpr_(const EQNode* op) override;
-  PrimExpr VisitExpr_(const NENode* op) override;
-  PrimExpr VisitExpr_(const LTNode* op) override;
-  PrimExpr VisitExpr_(const LENode* op) override;
-  PrimExpr VisitExpr_(const GTNode* op) override;
-  PrimExpr VisitExpr_(const GENode* op) override;
-  PrimExpr VisitExpr_(const CallNode* op) override;
-
-  using StmtExprMutator::VisitExpr_;
-  using StmtExprMutator::VisitStmt_;
-
- protected:
-  // a map from IterVar before rewrite to that after rewrite,
-  // ensures one old IterVar maps to exactly one new IterVar
-  std::unordered_map<const IterVarNode*, IterVar> ivmap_;
-};
 
 }  // namespace tir
 }  // namespace tvm

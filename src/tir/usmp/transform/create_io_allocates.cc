@@ -52,10 +52,8 @@ class IOAllocateCreator : public StmtExprVisitor {
 
  private:
   void VisitExpr_(const BufferLoadNode* op) override;
-  void VisitExpr_(const LoadNode* op) override;
   void VisitExpr_(const CallNode* op) override;
   void VisitStmt_(const BufferStoreNode* op) override;
-  void VisitStmt_(const StoreNode* op) override;
 
   /*! \brief Updates aliases that buffer vars inside the primfunc refer
    * to in terms call arguments they get bound to.*/
@@ -66,14 +64,14 @@ class IOAllocateCreator : public StmtExprVisitor {
   /*! \brief The main function that calls into operator subgraphs */
   PrimFunc main_func_;
   /*! \brief The input Vars of the main function */
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> inputs_;
+  std::unordered_set<Var> inputs_;
   /*! \brief The output Vars of the main function */
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> outputs_;
+  std::unordered_set<Var> outputs_;
   /*! \brief The buffer vars associated with the I/O Vars */
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> io_buffer_vars_;
+  std::unordered_set<Var> io_buffer_vars_;
   /*! \brief The aliases that buffer vars inside the primfunc refer
    * to in terms call arguments */
-  std::unordered_map<Var, Var, ObjectPtrHash, ObjectPtrEqual> aliases_;
+  std::unordered_map<Var, Var> aliases_;
   /*!
    * \brief The TIR main function calls by name to PrimFuncs to be able to
    * support BYOC. Therefore, this Map records functions that are present
@@ -150,8 +148,6 @@ void IOAllocateCreator::VisitExpr_(const BufferLoadNode* op) {
   StmtExprVisitor::VisitExpr_(op);
 }
 
-void IOAllocateCreator::VisitExpr_(const LoadNode* op) { LOG(FATAL) << "should not come here"; }
-
 void IOAllocateCreator::VisitStmt_(const BufferStoreNode* op) {
   if (aliases_.find(op->buffer->data) != aliases_.end()) {
     Var aliased_var = aliases_[op->buffer->data];
@@ -163,8 +159,6 @@ void IOAllocateCreator::VisitStmt_(const BufferStoreNode* op) {
   }
   StmtExprVisitor::VisitStmt_(op);
 }
-
-void IOAllocateCreator::VisitStmt_(const StoreNode* op) { LOG(FATAL) << "should not come here"; }
 
 IRModule IOAllocateCreator::operator()() {
   Array<Var> new_main_params;
@@ -195,9 +189,8 @@ IRModule IOAllocateCreator::operator()() {
     }
   }
   const GlobalVar& gv = mod_->GetGlobalVar(::tvm::runtime::symbol::tvm_module_main);
-  mod_->Update(gv,
-               PrimFunc(new_main_params, main_body, main_func_->ret_type, main_func_->buffer_map,
-                        main_func_->preflattened_buffer_map, main_func_->attrs, main_func_->span));
+  mod_->Update(gv, PrimFunc(new_main_params, main_body, main_func_->ret_type,
+                            main_func_->buffer_map, main_func_->attrs, main_func_->span));
   return mod_;
 }
 

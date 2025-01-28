@@ -42,7 +42,7 @@ class ScheduleError : public tvm::runtime::Error {
    * "Some error occurred on block {0} and loop {1} blah blah"
    * And renderer will replace {0} and {1} according to the list provided LocationsOfInterest. Right
    * now it only printed out all the locations in plain text, but in the future, we may want to mark
-   * the IR with underscores and attach names to each location of interest, like what synr does.
+   * the IR with underscores and attach names to each location of interest.
    */
   virtual String DetailRenderTemplate() const = 0;
   /*!
@@ -69,7 +69,7 @@ class LoopPositionError : public ScheduleError {
   String DetailRenderTemplate() const final {
     std::ostringstream os;
     os << "ScheduleError: The input loop {0} of " << primitive_
-       << " is required to be be an ancestor of block {1}.";
+       << " is required to be an ancestor of block {1}.";
     return os.str();
   }
 

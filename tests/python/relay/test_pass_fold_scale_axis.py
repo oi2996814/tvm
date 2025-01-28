@@ -20,6 +20,12 @@ import tvm
 from tvm import te
 from tvm import relay
 from tvm.relay import transform
+from tvm.relay.testing import create_workload
+from tvm.relay.build_module import bind_params_by_name
+
+
+def initializer(_, param):
+    param = np.zeros(param.shape)
 
 
 def _get_positive_scale(size):
@@ -112,7 +118,7 @@ def test_fold_fwd_simple():
 
         y1_folded = run_opt_pass(y1_folded, transform.InferType())
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 2, None)
     check((2, 2, 10, 10, 2), 8, (2, 4))
@@ -220,7 +226,7 @@ def test_fold_fwd_dual_path():
         weight = relay.var("weight", type_dict["weight"])
         y1_expected = expected(x, weight, in_bias, in_scale, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 3), 3, None)
     check((2, 4, 10, 2, 2), 4, (2, 2))
@@ -260,7 +266,7 @@ def test_fold_fwd_fail():
         y1 = before(x, weight, in_bias, in_scale, channels, blocking)
         y1 = run_opt_pass(y1, transform.InferType())
         y1_folded = run_opt_pass(y1, transform.ForwardFoldScaleAxis())
-        assert tvm.ir.structural_equal(y1, y1_folded)
+        tvm.ir.assert_structural_equal(y1, y1_folded)
 
     check((2, 11, 10, 4), 4, None)
     check((2, 11, 10, 2, 2), 4, (2, 2))
@@ -298,7 +304,7 @@ def test_fold_fwd_relu_fail():
         y1 = before(x, weight, in_bias, in_scale, channels, blocking)
         y1 = run_opt_pass(y1, transform.InferType())
         y1_folded = run_opt_pass(y1, transform.ForwardFoldScaleAxis())
-        assert tvm.ir.structural_equal(y1, y1_folded)
+        tvm.ir.assert_structural_equal(y1, y1_folded)
 
     in_scale = relay.var("in_scale", shape=(4,))
     check((2, 11, 10, 4), 4, None, in_scale)
@@ -344,7 +350,7 @@ def test_fold_fwd_let_fail():
         y1 = before(x, weight, in_bias, in_scale, channels)
         y1 = run_opt_pass(y1, transform.InferType())
         y1_folded = run_opt_pass(y1, transform.ForwardFoldScaleAxis())
-        assert tvm.ir.structural_equal(y1, y1_folded)
+        tvm.ir.assert_structural_equal(y1, y1_folded)
 
     check((2, 11, 10, 4), 4)
 
@@ -407,7 +413,7 @@ def test_fold_fwd_negative_scale():
         y1_folded = run_opt_pass(y1, transform.ForwardFoldScaleAxis())
         y1_expected = expected(x, weight, in_scale, in_channels, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 4, None)
     check((2, 2, 10, 10, 2), 8, (2, 2))
@@ -447,7 +453,7 @@ def test_fold_fwd_dense():
 
         y1_folded = run_opt_pass(y1_folded, transform.InferType())
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4), (3, 4))
     check((3, 5), (4, 5))
@@ -533,7 +539,7 @@ def test_fold_bwd_simple():
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
         y1_expected = expected(x, weight, out_bias, out_scale, in_channels, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 4, 8, None)
     check((2, 2, 10, 10, 16), 32, 64, (16, 16))
@@ -630,10 +636,54 @@ def test_fold_bwd_dual_path():
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
         y1_expected = expected(x, weight, out_bias, out_scale, in_channels, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 4, 8, None)
     check((2, 2, 10, 10, 2), 4, 8, (2, 2))
+
+
+def test_fold_bwd_simple_constant():
+    def before(data, weight, out_bias, channels):
+        y = relay.nn.conv2d(
+            data=data, weight=weight, kernel_size=(3, 3), channels=16, padding=(1, 1)
+        )
+
+        y = relay.add(y, out_bias)
+        c2 = relay.const(2.0)
+        y = relay.nn.relu(y)
+        y = relay.multiply(y, c2)
+        mod, params = create_workload(y, initializer)
+        mod["main"] = bind_params_by_name(mod["main"], params)
+        return mod
+
+    def expected(data, weight, out_bias, channels):
+        y0 = relay.nn.conv2d(
+            data=data, weight=weight, kernel_size=(3, 3), channels=16, padding=(1, 1)
+        )
+        y0 = relay.add(y0, out_bias)
+        y0 = relay.nn.relu(y0)
+        mod, params = create_workload(y0, initializer)
+        mod["main"] = bind_params_by_name(mod["main"], params)
+        return mod
+
+    def check(shape, channels):
+        x = relay.var("data", relay.TensorType(shape, "float32"))
+        weight = relay.var("weight")
+        out_bias = relay.var("in_bias", shape=(channels, 1, 1))
+
+        y0 = before(x, weight, out_bias, channels)
+        remove_last_multiply = tvm.transform.Sequential(
+            [
+                relay.transform.InferType(),
+                relay.transform.FoldScaleAxis(),
+            ]
+        )
+        with tvm.transform.PassContext(opt_level=3):
+            y0 = remove_last_multiply(y0)
+        _expect = expected(x, weight, out_bias, channels)
+        tvm.ir.assert_structural_equal(y0, _expect)
+
+    check((1, 3, 200, 200), 16)
 
 
 def test_fold_bwd_dual_consumer():
@@ -748,7 +798,7 @@ def test_fold_bwd_dual_consumer():
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
         y1_expected = expected(x, weight, out_bias, out_scale, in_channels, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 4, 4, None)
     check((2, 2, 10, 10, 2), 4, 4, (2, 2))
@@ -817,7 +867,7 @@ def test_fold_bwd_fail():
         y1 = fbefore(x, weight, out_bias, out_scale, in_channels, channels, blocking)
         y1 = run_opt_pass(y1, transform.InferType())
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
-        assert tvm.ir.structural_equal(y1_folded, y1)
+        tvm.ir.assert_structural_equal(y1_folded, y1)
 
     check((4, 4, 10, 10), 4, 4, None, fail1)
     check((2, 2, 10, 10, 2), 4, 4, (2, 2), fail1)
@@ -849,7 +899,7 @@ def test_fold_bwd_relu_fail():
         y1 = before(x, weight, out_scale, channels, blocking)
         y1 = run_opt_pass(y1, transform.InferType())
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
-        assert tvm.ir.structural_equal(y1, y1_folded)
+        tvm.ir.assert_structural_equal(y1, y1_folded)
 
     out_scale = relay.var("in_scale", shape=(4, 1, 1))
     check((4, 4, 10, 10), 4, None, out_scale)
@@ -922,7 +972,7 @@ def test_fold_bwd_negative_scale():
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
         y1_expected = expected(x, weight, out_scale, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 8, None)
     check((2, 2, 10, 10, 2), 8, (2, 2))
@@ -963,7 +1013,7 @@ def test_fold_bwd_dense():
 
         y1_folded = run_opt_pass(y1_folded, transform.InferType())
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4), (3, 4))
     check((3, 5), (4, 5))
@@ -1023,7 +1073,7 @@ def test_fold_bwd_bias_add():
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
         y1_expected = expected(x, weight, out_bias, out_scale, channels)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10), 4)
 
@@ -1110,7 +1160,7 @@ def test_fold_fwd_conv3d():
 
         y1_folded = run_opt_pass(y1_folded, transform.InferType())
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10, 10), 2, None)
     check((2, 2, 10, 10, 10, 2), 8, (2, 4))
@@ -1198,7 +1248,7 @@ def test_fold_bwd_conv3d():
         y1_folded = run_opt_pass(y1, transform.BackwardFoldScaleAxis())
         y1_expected = expected(x, weight, out_bias, out_scale, in_channels, channels, blocking)
         y1_expected = run_opt_pass(y1_expected, transform.InferType())
-        assert tvm.ir.structural_equal(y1_folded, y1_expected)
+        tvm.ir.assert_structural_equal(y1_folded, y1_expected)
 
     check((2, 4, 10, 10, 10), 4, 8, None)
     check((2, 2, 10, 10, 10, 16), 32, 64, (16, 16))
@@ -1211,6 +1261,7 @@ if __name__ == "__main__":
     test_fold_fwd_relu_fail()
     test_fold_fwd_negative_scale()
     test_fold_fwd_dense()
+    test_fold_bwd_simple_constant()
     test_fold_bwd_simple()
     test_fold_bwd_dual_path()
     test_fold_bwd_dual_consumer()

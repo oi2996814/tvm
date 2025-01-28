@@ -72,7 +72,8 @@ inline Optional<PrimExpr> TryConstFold(PrimExpr a);
  * \return the checked result.
  */
 inline bool IsIndexType(const DataType& type) {
-  return type.is_int() && type.lanes() == 1 && (type.bits() == 32 || type.bits() == 64);
+  return type.is_int() && !type.is_scalable_or_fixed_length_vector() &&
+         (type.bits() == 32 || type.bits() == 64);
 }
 
 /*! \brief Helper to get const folding result repr in int64. */
@@ -142,8 +143,6 @@ inline Optional<PrimExpr> TryConstFold<tir::Add>(PrimExpr a, PrimExpr b) {
                                                        static_cast<float>(fb->value)));
       } else if (rtype.bits() == 64) {
         return FloatImm(rtype, fa->value + fb->value);
-      } else {
-        return NullOpt;
       }
     }
     if (fa && fa->value == 0) return b;
@@ -171,8 +170,6 @@ inline Optional<PrimExpr> TryConstFold<tir::Sub>(PrimExpr a, PrimExpr b) {
                                                        static_cast<float>(fb->value)));
       } else if (rtype.bits() == 64) {
         return FloatImm(rtype, fa->value - fb->value);
-      } else {
-        return NullOpt;
       }
     }
     if (fb && fb->value == 0) return a;
@@ -202,8 +199,6 @@ inline Optional<PrimExpr> TryConstFold<tir::Mul>(PrimExpr a, PrimExpr b) {
                                                        static_cast<float>(fb->value)));
       } else if (rtype.bits() == 64) {
         return FloatImm(rtype, fa->value * fb->value);
-      } else {
-        return NullOpt;
       }
     }
     if (fa) {
@@ -236,14 +231,13 @@ inline Optional<PrimExpr> TryConstFold<tir::Div>(PrimExpr a, PrimExpr b) {
       if (pb->value == 1) return a;
       ICHECK_NE(pb->value, 0) << "Divide by zero";
     }
-    if (fa && fb && fb->value != 0) {
+    if (fa && fb) {
+      ICHECK_NE(fb->value, 0) << "Divide by zero";
       if (rtype.bits() == 32) {
         return FloatImm(rtype, GetFoldResultDoubleRepr(static_cast<float>(fa->value) /
                                                        static_cast<float>(fb->value)));
       } else if (rtype.bits() == 64) {
         return FloatImm(rtype, fa->value / fb->value);
-      } else {
-        return NullOpt;
       }
     }
     if (fa && fa->value == 0) return a;
@@ -448,7 +442,7 @@ struct SymbolicLimits {
 /*!
  * \brief Opaque expression representing positive infinity.
  *
- *  It can can only be used as parameter of by min/max
+ *  It can only be used as parameter of by min/max
  *  for integer analysis and cannot be used in normal expressions.
  *
  * \return positive infinity.
@@ -466,7 +460,7 @@ inline bool is_pos_inf(const PrimExpr& value) { return value.same_as(SymbolicLim
 /*!
  * \brief Opaque expression representing negative infinity.
  *
- *  It can can only be used as parameter of by min/max
+ *  It can only be used as parameter of by min/max
  *  for integer analysis and cannot be used in normal expressions.
  *
  * \return negative infinity.

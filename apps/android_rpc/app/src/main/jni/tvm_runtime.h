@@ -42,6 +42,7 @@
 #include "../src/runtime/graph_executor/graph_executor_factory.cc"
 #include "../src/runtime/library_module.cc"
 #include "../src/runtime/logging.cc"
+#include "../src/runtime/memory/memory_manager.cc"
 #include "../src/runtime/minrpc/minrpc_logger.cc"
 #include "../src/runtime/module.cc"
 #include "../src/runtime/ndarray.cc"
@@ -64,11 +65,13 @@
 #ifdef TVM_OPENCL_RUNTIME
 #include "../src/runtime/opencl/opencl_device_api.cc"
 #include "../src/runtime/opencl/opencl_module.cc"
+#include "../src/runtime/opencl/opencl_wrapper/opencl_wrapper.cc"
 #include "../src/runtime/opencl/texture_pool.cc"
 #include "../src/runtime/source_utils.cc"
 #endif
 
 #ifdef TVM_VULKAN_RUNTIME
+#include "../src/runtime/vulkan/vulkan_amdrgp.cc"
 #include "../src/runtime/vulkan/vulkan_buffer.cc"
 #include "../src/runtime/vulkan/vulkan_common.cc"
 #include "../src/runtime/vulkan/vulkan_device.cc"
@@ -95,12 +98,12 @@ namespace detail {
 // Override logging mechanism
 [[noreturn]] void LogFatalImpl(const std::string& file, int lineno, const std::string& message) {
   std::string m = file + ":" + std::to_string(lineno) + ": " + message;
-  __android_log_write(ANDROID_LOG_DEBUG, "TVM_RUNTIME", m.c_str());
+  __android_log_write(ANDROID_LOG_FATAL, "TVM_RUNTIME", m.c_str());
   throw InternalError(file, lineno, message);
 }
-void LogMessageImpl(const std::string& file, int lineno, const std::string& message) {
+void LogMessageImpl(const std::string& file, int lineno, int level, const std::string& message) {
   std::string m = file + ":" + std::to_string(lineno) + ": " + message;
-  __android_log_write(ANDROID_LOG_DEBUG, "TVM_RUNTIME", m.c_str());
+  __android_log_write(ANDROID_LOG_DEBUG + level, "TVM_RUNTIME", m.c_str());
 }
 
 }  // namespace detail

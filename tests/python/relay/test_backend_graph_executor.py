@@ -196,7 +196,7 @@ def test_plan_2d_memory():
         ]
     }
 
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
         #[version = "0.0.5"]
         def @main(%data1: Tensor[(1, 32, 40, 40), float32],
@@ -467,6 +467,12 @@ def test_graph_executor_api():
         assert isinstance(dtype_dict[name], tvm.runtime.container.String)
         assert dtype_dict[name] == ty.dtype
 
+    shape_dict, dtype_dict = mod.get_output_info()
+    assert isinstance(shape_dict, tvm.container.Map)
+    assert isinstance(dtype_dict, tvm.container.Map)
+    for i, key in enumerate(shape_dict):
+        assert mod.get_output_index(key) == i
+
 
 @tvm.testing.requires_llvm
 def test_benchmark():
@@ -527,4 +533,4 @@ def test_benchmark_end_to_end_rpc():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

@@ -80,7 +80,7 @@ You can also start an interactive session by typing
 The built docker images are prefixed by ``tvm.``, for example the command
 
 ````bash
-./docker/build.sh image_name 
+./docker/build.sh image_name
 ````
 
 produces the image ``tvm.ci_cpu`` that is displayed in the list of docker images
@@ -90,7 +90,7 @@ using the command ``docker images``. To run an interactive terminal, execute:
 ./docker/bash.sh tvm.ci_cpu
 ````
 
-or 
+or
 
 ````bash
 ./docker/bash.sh tvm.ci_cpu echo hello tvm world
@@ -98,7 +98,7 @@ or
 
 the same applies to the other images (``./docker/Dockerfile.*```).
 
-The command ``./docker/build.sh image_name COMMANDS`` is almost equivelant to 
+The command ``./docker/build.sh image_name COMMANDS`` is almost equivelant to
 ``./docker/bash.sh image_name COMMANDS`` but in the case of ``bash.sh``
 a build attempt is not done.
 
@@ -110,7 +110,7 @@ tasks.
 - lint the python codes
 
   ```bash
-  ./docker/build.sh tvm.ci_lint make pylint
+  ./docker/build.sh ci_lint make pylint
   ```
 
 - build codes with CUDA support

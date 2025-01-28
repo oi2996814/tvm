@@ -134,6 +134,9 @@ TEST_F(HexagonDeviceAPITest, alloc_scalar) {
 
   void* hexscalar = hexapi->AllocDataSpace(hex_dev, 0, new int64_t, int8, global_vtcm_scope);
   CHECK(hexscalar != nullptr);
+
+  hexscalar = hexapi->AllocDataSpace(hex_dev, 0, nullptr, int8, global_vtcm_scope);
+  CHECK(hexscalar != nullptr);
 }
 
 // alloc and free of the same buffer on different devices should throw
@@ -159,19 +162,6 @@ TEST_F(HexagonDeviceAPITest, runtime_buffer_manager) {
   hexapi->FreeDataSpace(hex_dev, runtime_buf);
   hexapi->AcquireResources();
   EXPECT_THROW(hexapi->FreeDataSpace(hex_dev, runtime_buf), InternalError);
-}
-
-// Ensure RPC buffer manager is always available
-TEST_F(HexagonDeviceAPITest, rpc_buffer_manager) {
-  void* rpc_buf;
-  rpc_buf = hexapi->AllocRpcBuffer(nbytes, alignment);
-  CHECK(rpc_buf != nullptr);
-  hexapi->ReleaseResources();
-  hexapi->FreeRpcBuffer(rpc_buf);
-  rpc_buf = hexapi->AllocRpcBuffer(nbytes, alignment);
-  CHECK(rpc_buf != nullptr);
-  hexapi->AcquireResources();
-  hexapi->FreeRpcBuffer(rpc_buf);
 }
 
 // Ensure thread manager is properly configured and destroyed

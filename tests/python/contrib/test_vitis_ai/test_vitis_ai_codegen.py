@@ -373,11 +373,11 @@ def test_annotate(dpu_target):
 
     ref_mod = expected()
 
-    assert tvm.ir.structural_equal(partitioned_mod, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned_mod, ref_mod, map_free_vars=True)
 
 
 if __name__ == "__main__":
     if sys.platform == "win32":
         print("Skip test on Windows for now")
         sys.exit(0)
-    pytest.main([__file__])
+    tvm.testing.main()

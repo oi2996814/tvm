@@ -21,7 +21,7 @@
 # Usage:
 #   find_opencl(${USE_OPENCL})
 #
-# - When USE_OPENCL=ON, use auto search
+# - When USE_OPENCL=ON, use OpenCL wrapper for dynamic linking
 # - When USE_OPENCL=/path/to/opencl-sdk-path, use the sdk.
 #   Can be useful when cross compiling and cannot rely on
 #   CMake to provide the correct library as part of the
@@ -46,7 +46,7 @@ macro(find_opencl use_opencl)
    endif()
 
    if(__opencl_sdk)
-     set(OpenCL_INCLUDE_DIRS ${__opencl_sdk}/include)
+     set(OpenCL_INCLUDE_DIRS ${__opencl_sdk}/include ${__opencl_sdk})
      if (CMAKE_FIND_ROOT_PATH_MODE_LIBRARY STREQUAL "ONLY")
        set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
      endif()

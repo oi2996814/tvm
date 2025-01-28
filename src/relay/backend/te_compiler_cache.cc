@@ -19,7 +19,9 @@
 
 #include "./te_compiler_cache.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/driver/driver_api.h>
+#include <tvm/ir/name_supply.h>
 #include <tvm/ir/type_functor.h>
 #include <tvm/meta_schedule/database.h>
 #include <tvm/relay/analysis.h>
@@ -44,14 +46,16 @@
 
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "../../printer/text_printer.h"
 #include "../../te/operation/create_primfunc.h"
 #include "../op/memory/memory.h"
+#include "../src/meta_schedule/module_equality.h"
+#include "../src/meta_schedule/trace_apply.h"
 #include "../transforms/meta_schedule_layout_rewrite.h"
 #include "utils.h"
 
@@ -123,11 +127,96 @@ Array<IndexExpr> GetShape(const Array<IndexExpr>& shape) {
   return res;
 }
 
+// Helper class that is used during lowering to TE.
+// It matches sequence of Ops and lower them into single TOPI operation. All supported patterns are
+// enumerated in "supported_patterns_".
+class QnnPatternMatcher {
+ public:
+  QnnPatternMatcher()
+      : qnn_conv2d_op_(Op::Get("qnn.conv2d")),
+        qnn_dense_op_(Op::Get("qnn.dense")),
+        qnn_dense_pack_op_(Op::Get("qnn.contrib_dense_pack")),
+        qnn_requantize_op_(Op::Get("qnn.requantize")),
+        bias_add_op_(Op::Get("add")) {}
+
+  // Memoize visited operations
+  void Register(const CallNode* call_node) {
+    ICHECK(call_node->op.as<OpNode>());
+    Op op = Downcast<Op>(call_node->op);
+    if (op == qnn_conv2d_op_) {
+      registered_ops_.push_front(P_QConv2d);
+      ICHECK(anchor_op_ == nullptr);
+      anchor_op_ = call_node;
+    } else if (op == qnn_requantize_op_) {
+      registered_ops_.push_front(P_QRequantize);
+    } else if (op == bias_add_op_) {
+      registered_ops_.push_front(P_BiasAdd);
+    } else if (op == qnn_dense_op_) {
+      registered_ops_.push_front(P_QDense);
+      ICHECK(anchor_op_ == nullptr);
+      anchor_op_ = call_node;
+    } else if (op == qnn_dense_pack_op_) {
+      registered_ops_.push_front(P_QDensePack);
+      ICHECK(anchor_op_ == nullptr);
+      anchor_op_ = call_node;
+    } else {
+      registered_ops_.push_front(P_Opaque);
+    }
+  }
+
+  // Check whether given Op is a part of matched pattern.
+  bool find(const Op& op) {
+    if (registered_ops_.empty()) return false;
+
+    if (op == qnn_conv2d_op_ || op == qnn_requantize_op_ || op == bias_add_op_ ||
+        op == qnn_dense_op_ || op == qnn_dense_pack_op_) {
+      for (const auto& pat : supported_patterns_) {
+        auto it =
+            std::search(registered_ops_.begin(), registered_ops_.end(), pat.begin(), pat.end());
+        if (it != registered_ops_.end()) return true;
+      }
+    }
+    return false;
+  }
+
+  // returns whether given Op is last in the pattern sequence.
+  bool IsLeafOp(const Op& op) { return op == qnn_requantize_op_; }
+
+  const CallNode* GetAnchorOp() { return anchor_op_; }
+
+  void Clear() { registered_ops_.clear(); }
+
+ private:
+  const Op& qnn_conv2d_op_;
+  const Op& qnn_dense_op_;
+  const Op& qnn_dense_pack_op_;
+  const Op& qnn_requantize_op_;
+  const Op& bias_add_op_;
+
+  // Main (complicated) operation in the primitive (for example qnn.conv2d, qnn.dense etc.).
+  const CallNode* anchor_op_ = nullptr;
+
+  enum POper { P_QConv2d, P_QDense, P_QDensePack, P_BiasAdd, P_QRequantize, P_Opaque };
+
+  std::deque<POper> registered_ops_;
+
+  const std::vector<std::deque<POper>> supported_patterns_ = {
+      {P_QDense, P_BiasAdd, P_QRequantize},      // qnn.dense -> bias_add -> qnn.requantize
+      {P_QDense, P_QRequantize},                 // qnn.dense -> qnn.requantize
+      {P_QDensePack, P_BiasAdd, P_QRequantize},  // qnn.contrib_dense_pack -> bias -> qnn.requantize
+      {P_QDensePack, P_QRequantize},             // qnn.contrib_dense_pack -> qnn.requantize
+      {P_QConv2d, P_BiasAdd, P_QRequantize},     // qnn.conv2d -> bias_add -> qnn.requantize
+      {P_QConv2d, P_QRequantize}                 // qnn.conv2d -> qnn.requantize
+  };
+};
+
 // Lowers Relay primitive Function to TE Compute
 class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor>> {
  public:
-  explicit LowerToTECompute(Target target)
-      : target_(target), device_copy_op_(Op::Get("device_copy")) {}
+  LowerToTECompute(Target target, NameSupply constants_name_supply)
+      : target_(target),
+        device_copy_op_(Op::Get("device_copy")),
+        constants_name_supply_(constants_name_supply) {}
 
   Array<te::Tensor> Lower(const Function& relay_func) {
     for (Var param : relay_func->params) {
@@ -162,7 +251,6 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
 
   Array<te::Tensor> VisitExpr_(const VarNode* op) final {
     LOG(FATAL) << "Unexpected free variable " << PrettyPrint(GetRef<Var>(op));
-    return {};
   }
 
   Array<te::Tensor> VisitExpr_(const ConstantNode* op) final {
@@ -191,7 +279,6 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
               return make_const(dtype, static_cast<const double*>(data)[0]);
             } else {
               LOG(FATAL) << dtype << " not handled";
-              return tvm::PrimExpr();
             }
           },
           "compile_engine_const", topi::kBroadcast);
@@ -202,7 +289,7 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
       std::stringstream ss;
       std::string s = readable_name_stream_.str();
       std::replace(s.begin(), s.end(), '.', '_');
-      ss << s << "_constant_" << const_index++;
+      ss << constants_name_supply_->FreshName(s + "_constant");
       tvm::te::Tensor tensor = tvm::te::placeholder(GetShape(ttype->shape), ttype->dtype, ss.str());
       constant_tensors_[op] = tensor;
       return {tensor};
@@ -213,21 +300,17 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
     static auto flower_call = tvm::runtime::Registry::Get("relay.backend.lower_call");
     ICHECK(flower_call) << "relay.backend.lower_call is not registered.";
 
+    pattern_matcher_.Register(call_node);
+
     Array<te::Tensor> inputs;
-    int count_tuple = 0;
+    // int count_tuple = 0;
     for (Expr arg : call_node->args) {
       if (arg->checked_type().as<TupleTypeNode>()) {
-        ++count_tuple;
+        // ++count_tuple;
       }
       for (te::Tensor tensor : VisitExpr(arg)) {
         inputs.push_back(tensor);
       }
-    }
-
-    if (count_tuple) {
-      ICHECK_EQ(call_node->args.size(), 1U)
-          << "Only functions with a single tuple input are allowed, but " << count_tuple
-          << " were provided.";
     }
 
     ICHECK(call_node->op.as<OpNode>()) << "Primitive function only allows call into primitive ops";
@@ -236,9 +319,29 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
     // TODO(mbs): device_copy cleanup
     ICHECK_NE(op, device_copy_op_) << "device_copy cannot be lowered";
 
-    LoweredOutput lowered_out = (*flower_call)(GetRef<Call>(call_node), inputs, target_);
-    Array<te::Tensor> outputs = lowered_out->outputs;
-    op_implementations_[op.operator->()] = lowered_out->implementation;
+    Array<te::Tensor> outputs;
+
+    if (pattern_matcher_.find(op)) {
+      if (pattern_matcher_.IsLeafOp(op)) {
+        // Lower anchor op when pattern leaf op was reached
+        auto anchor_op = pattern_matcher_.GetAnchorOp();
+        LoweredOutput lowered_out =
+            (*flower_call)(GetRef<Call>(anchor_op), inputs, target_, call_node->checked_type());
+        outputs = lowered_out->outputs;
+        Op a_op = Downcast<Op>(anchor_op->op);
+        op_implementations_[a_op.operator->()] = lowered_out->implementation;
+
+        pattern_matcher_.Clear();
+      } else {
+        // Forward inputs as "outputs" for successor.
+        readable_name_stream_ << '_' << op->name;
+        return inputs;
+      }
+    } else {
+      LoweredOutput lowered_out = (*flower_call)(GetRef<Call>(call_node), inputs, target_);
+      outputs = lowered_out->outputs;
+      op_implementations_[op.operator->()] = lowered_out->implementation;
+    }
 
     if (outputs.size() != 1) {
       const auto* tuple_type = call_node->checked_type().as<TupleTypeNode>();
@@ -254,7 +357,6 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
 
   Array<te::Tensor> VisitExpr_(const FunctionNode* op) final {
     LOG(FATAL) << "Primitive Functions can not contain nested functions.";
-    return Array<te::Tensor>();
   }
 
   Array<te::Tensor> VisitExpr_(const LetNode* op) final {
@@ -294,16 +396,17 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
   std::string candidate_name_;
 
  private:
+  QnnPatternMatcher pattern_matcher_;
+
   tvm::Target target_;
   std::ostringstream readable_name_stream_;
-  // Index of the global constants
-  static int const_index;
   // Cache device copy op for equivalence checking to reduce registry lookup
   // overhead for each invocation of call node when retrieving schedules.
   const Op& device_copy_op_;
+  // A NameSupply object passed from a caller, used to assign unique names to constants
+  // across different invocations of LowerToTECompute.
+  NameSupply constants_name_supply_;
 };
-
-int LowerToTECompute::const_index = 0;
 
 using namespace tvm::tir;
 
@@ -368,20 +471,21 @@ class AllocateConstReplaceConstant : public StmtExprMutator {
 // Construct a schedule for a given Relay primitive function and target.
 class ScheduleBuilder : public ExprVisitor {
  public:
-  explicit ScheduleBuilder(Target target) : target_(target) {
+  explicit ScheduleBuilder(Target target)
+      : target_(target),
+        mod_eq_structural_(meta_schedule::ModuleEquality::Create("ignore-ndarray")) {
     // Whether to use auto_scheduler schedule.
     use_auto_scheduler_ = backend::IsAutoSchedulerEnabled();
+    database_ = meta_schedule::Database::Current();
     if (backend::IsMetaScheduleEnabled()) {
-      database_ = meta_schedule::Database::Current();
       CHECK(database_.defined()) << "ValueError: `use_meta_schedule` is enabled in Relay "
                                     "build, but no `meta_schedule.Database` context is provided. ";
-    } else {
-      database_ = NullOpt;
     }
   }
 
-  CachedFunc Create(const Function& relay_func, GlobalVarSupply global_var_supply) {
-    LowerToTECompute lower_te_compute(target_);
+  CachedFunc Create(const Function& relay_func, GlobalVarSupply global_var_supply,
+                    NameSupply constant_name_supply) {
+    LowerToTECompute lower_te_compute(target_, constant_name_supply);
     Array<te::Tensor> tensor_outs = lower_te_compute.Lower(relay_func);
     Array<te::Tensor> fn_inputs = lower_te_compute.fn_inputs_;
     VisitExpr(relay_func->body);
@@ -441,8 +545,8 @@ class ScheduleBuilder : public ExprVisitor {
             TuningRecord record = opt_record.value();
             for (const Instruction& inst : record->trace->insts) {
               if (inst->kind.same_as(kind_transform_layout)) {
-                ICHECK_EQ(inst->attrs.size(), 4);
-                auto index_map = Downcast<IndexMap>(inst->attrs[2]);
+                ICHECK_EQ(inst->inputs.size(), 2);
+                auto index_map = Downcast<IndexMap>(inst->inputs[1]);
 
                 if (!const_collector.constants.empty()) {
                   // In this case, RewriteLayout is acting on an AllocateConst node.
@@ -479,7 +583,27 @@ class ScheduleBuilder : public ExprVisitor {
                       << "Only one layout-free constant is supported by RewriteLayout for now";
                   auto constant = const_collector.constants[0];
 
-                  if (constant.Shape().size() == index_map->initial_indices.size()) {
+                  auto is_constant_transformed = [index_map](runtime::NDArray c) {
+                    if (c.Shape().size() != index_map->initial_indices.size()) {
+                      return true;
+                    }
+                    size_t src_size_1d = 1;
+                    Array<PrimExpr> orig_shape;
+                    for (size_t i = 0; i < c.Shape().size(); ++i) {
+                      src_size_1d *= c->shape[i];
+                      orig_shape.push_back(PrimExpr(static_cast<int>((c->shape[i]))));
+                    }
+                    arith::Analyzer analyzer;
+                    auto dst_shape = index_map->MapShape(orig_shape, &analyzer);
+                    std::vector<int64_t> dst_shape_int;
+                    size_t dst_size_1d = 1;
+                    for (size_t i = 0; i < dst_shape.size(); ++i) {
+                      dst_size_1d *= dst_shape[i].as<IntImmNode>()->value;
+                    }
+                    return src_size_1d != dst_size_1d;
+                  };
+
+                  if (!is_constant_transformed(constant)) {
                     // This is the first case, reached during the MetaScheduleLayoutRewrite pass.
                     //
                     // A layout-free constant having the same rank as an input to the index map
@@ -521,9 +645,19 @@ class ScheduleBuilder : public ExprVisitor {
                 MetaScheduleLayoutRewriter::LayoutQueuePush(index_map);
               }
             }
+
             Schedule sch = Schedule::Traced(query_mod, /*seed=*/-1, /*debug_mask=*/0,
                                             tir::ScheduleErrorRenderLevel::kDetail);
-            record->trace->ApplyToSchedule(sch, /*remove_postproc=*/false);
+
+            if (!mod_eq_structural_->Equal(query_mod, opt_record.value()->workload->mod)) {
+              // When the database lookup succeeds while structural equality check fails,
+              // it implies that the anchor block based equality has been used during tuning.
+              // The trace in the record cannot directly be applied to this query module.
+              meta_schedule::ScheduleUsingAnchorTrace(sch, record->trace, target_);
+            } else {
+              record->trace->ApplyToSchedule(sch, /*remove_postproc=*/false);
+            }
+
             IRModule mod = sch->mod();
             ICHECK_EQ(mod->functions.size(), 1);
             mod = tir::transform::RemoveWeightLayoutRewriteBlock(/*skip_ndarray_rewrite*/ false)(
@@ -538,7 +672,7 @@ class ScheduleBuilder : public ExprVisitor {
             // (dispatch & 4): controls whether to raise fatal errors for missing TIR
             if (dispatch & 2) {
               LOG(WARNING) << "Cannot find workload: " << prim_fn_var->name_hint << "\n"
-                           << tir::AsTVMScript(f.value());
+                           << f.value();
             } else {
               LOG(WARNING) << "Cannot find workload: " << prim_fn_var->name_hint;
             }
@@ -605,6 +739,7 @@ class ScheduleBuilder : public ExprVisitor {
   int anchor_op_pattern_{0};
   bool use_auto_scheduler_;
   Optional<meta_schedule::Database> database_;
+  std::unique_ptr<meta_schedule::ModuleEquality> mod_eq_structural_;
 };
 
 /*!
@@ -615,8 +750,8 @@ class ScheduleBuilder : public ExprVisitor {
  *  The funcs field in cache is not yet populated.
  */
 CachedFunc PrimFuncFor(const Function& source_func, const Target& target,
-                       GlobalVarSupply global_var_supply) {
-  return ScheduleBuilder(target).Create(source_func, global_var_supply);
+                       GlobalVarSupply global_var_supply, NameSupply constant_name_supply) {
+  return ScheduleBuilder(target).Create(source_func, global_var_supply, constant_name_supply);
 }
 
 // Creates shape function from functor.
@@ -765,7 +900,6 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
     }
     if (param_states_.find(var) == param_states_.end()) {
       LOG(FATAL) << "Unexpected free variable " << PrettyPrint(var);
-      return {};
     } else {
       ICHECK(data_dependents_per_input_.size());
       auto data_dependent = data_dependents_per_input_.back();
@@ -822,7 +956,6 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
               return make_const(dtype, static_cast<const uint8_t*>(data)[0]);
             } else {
               LOG(FATAL) << "not handled";
-              return tvm::PrimExpr();
             }
           },
           "data_const", topi::kBroadcast);
@@ -903,7 +1036,6 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
 
   Array<te::Tensor> VisitExpr_(const FunctionNode* op) final {
     LOG(FATAL) << "Nested functions are not allowed to be visited.";
-    return Array<te::Tensor>();
   }
 
   Array<te::Tensor> VisitExpr_(const LetNode* op) final {
@@ -957,8 +1089,9 @@ CachedFunc ShapeFuncFor(const Function& prim_func, const Target& target,
 }
 
 std::tuple<Array<te::Tensor>, Array<runtime::NDArray>, std::string> LowerTECompute(
-    const Function& source_func, Target target, bool return_inputs) {
-  LowerToTECompute lower_te_compute(target);
+    const Function& source_func, Target target, NameSupply constant_name_supply,
+    bool return_inputs) {
+  LowerToTECompute lower_te_compute(target, constant_name_supply);
   Array<te::Tensor> outputs = lower_te_compute.Lower(source_func);
   // Following ScheduleBuilder, remove placeholder ops from outputs.
   tvm::Array<te::Tensor> tensor_outs;
@@ -981,9 +1114,36 @@ std::tuple<Array<te::Tensor>, Array<runtime::NDArray>, std::string> LowerTECompu
   return std::make_tuple(tensor_outs, constants, lower_te_compute.candidate_name_);
 }
 
+std::pair<Optional<tir::PrimFunc>, std::string> LowerToPrimFunc(const Function& relay_func,
+                                                                Target target,
+                                                                NameSupply constant_name_supply) {
+  ICHECK(relay_func->HasNonzeroAttr(attr::kPrimitive))
+      << "The input must be a Relay primitive function.";
+
+  auto [inputs_outputs, constants, fused_name] =
+      tec::LowerTECompute(relay_func, target, constant_name_supply, /*return_inputs=*/true);
+  auto tir_converter = backend::GetTIRConverter();
+  return std::make_pair(tir_converter(inputs_outputs, constants), fused_name);
+}
+
+tir::PrimFunc LowerToPrimFunc(const Function& relay_func, Target target) {
+  auto [f_opt, _] = LowerToPrimFunc(relay_func, target, NameSupply());
+  (void)_;  // to suppress -Werror=unused-variable warning
+  if (f_opt) {
+    return f_opt.value();
+  }
+  LOG(FATAL) << "Failed to convert the Relay function: " << AsText(relay_func, false);
+  return PrimFunc();
+}
+
+TVM_REGISTER_GLOBAL("relay.backend.LowerToPrimFunc")
+    .set_body_typed([](Function relay_func, Target target) {
+      return LowerToPrimFunc(relay_func, target);
+    });
+
 TVM_REGISTER_GLOBAL("relay.backend.LowerToTE").set_body_typed([](Function prim_func) {
   auto tgt = tvm::Target("ext_dev");
-  LowerToTECompute lower_te_compute(tgt);
+  LowerToTECompute lower_te_compute(tgt, NameSupply());
   auto outputs = lower_te_compute.Lower(prim_func);
   return CachedFunc(tgt, GlobalVar(lower_te_compute.candidate_name_), lower_te_compute.fn_inputs_,
                     outputs, te::Schedule(), tir::PrimFunc(), {},

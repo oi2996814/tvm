@@ -34,6 +34,11 @@ export type PtrOffset = number;
 export type FTVMGetLastError = () => Pointer;
 
 /**
+ * void TVMAPISetLastError(const char* msg);
+ */
+export type FTVMAPISetLastError = (msg: Pointer) => void;
+
+/**
  * int TVMModGetFunction(TVMModuleHandle mod,
  *                       const char* func_name,
  *                       int query_imports,
@@ -46,6 +51,7 @@ export type FTVMModGetFunction = (
  *                  TVMModuleHandle dep);
  */
 export type FTVMModImport = (mod: Pointer, dep: Pointer) => number;
+
 /**
  * int TVMModFree(TVMModuleHandle mod);
  */
@@ -161,6 +167,27 @@ export type FTVMBackendPackedCFunc = (
   argValues: Pointer, argCodes: Pointer, nargs: number,
   outValue: Pointer, outCode: Pointer) => number;
 
+
+/**
+ * int TVMObjectFree(TVMObjectHandle obj);
+ */
+export type FTVMObjectFree = (obj: Pointer) => number;
+
+/**
+ * int TVMObjectGetTypeIndex(TVMObjectHandle obj, unsigned* out_tindex);
+ */
+export type FTVMObjectGetTypeIndex = (obj: Pointer, out_tindex: Pointer) => number;
+
+/**
+ * int TVMObjectTypeIndex2Key(unsigned tindex, char** out_type_key);
+ */
+export type FTVMObjectTypeIndex2Key = (type_index: number, out_type_key: Pointer) => number;
+
+/**
+ * int TVMObjectTypeKey2Index(const char* type_key, unsigned* out_tindex);
+ */
+export type FTVMObjectTypeKey2Index = (type_key: Pointer, out_tindex: Pointer) => number;
+
 // -- TVM Wasm Auxiliary C API --
 
 /** void* TVMWasmAllocSpace(int size); */
@@ -225,5 +252,6 @@ export const enum ArgTypeCode {
   TVMStr = 11,
   TVMBytes = 12,
   TVMNDArrayHandle = 13,
-  TVMObjectRValueRefArg = 14
+  TVMObjectRValueRefArg = 14,
+  TVMArgBool = 15,
 }

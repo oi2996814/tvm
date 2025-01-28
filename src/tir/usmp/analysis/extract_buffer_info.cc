@@ -125,7 +125,7 @@ class BufferInfoExtractor : public StmtExprVisitor {
    * \brief Maintains the mapping of buffer variable to their allocate nodes to ensure
    * that only one BufferInfo object is created.
    */
-  std::unordered_map<tir::Var, AllocateInfo, ObjectPtrHash, ObjectPtrEqual> allocate_infos;
+  std::unordered_map<tir::Var, AllocateInfo> allocate_infos;
   /*!
    * \brief Indicates a count of stmts visited so far to use as a metric of liveness
    */
@@ -454,12 +454,7 @@ void BufferInfoExtractor::UpdateAliases(const Array<PrimExpr>& args, const PrimF
     // If tir.allocates are passed in to functions
     // The function params are re-directed to point
     // to the original allocate
-    if (arg->IsInstance<LoadNode>()) {
-      auto load = Downcast<Load>(arg);
-      if (allocate_infos.count(load->buffer_var)) {
-        allocate_infos[param_buf] = allocate_infos[load->buffer_var];
-      }
-    } else if (arg->IsInstance<VarNode>()) {
+    if (arg->IsInstance<VarNode>()) {
       auto var = Downcast<Var>(arg);
       if (allocate_infos.count(var)) {
         allocate_infos[param_buf] = allocate_infos[var];

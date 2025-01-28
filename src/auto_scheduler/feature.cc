@@ -443,6 +443,11 @@ class CoefficientExtractor : public StmtExprVisitor {
 // Compute stride for the accesses to a buffer
 int64_t ComputeStride(const std::vector<std::vector<PrimExpr>>& indices,
                       const std::vector<int>& shape, const VarNode* stride_var) {
+  // Use stride of 1 for 0-dimensional buffers. 0-dim buffers has a single
+  // index access, so we have to check here.
+  if (shape.size() == 0) {
+    return 1;
+  }
   int64_t min_stride = std::numeric_limits<int64_t>::max();
   bool find = false;
   CoefficientExtractor extractor;
@@ -1370,8 +1375,7 @@ void GetPerStoreFeaturesWorkerFunc(const SearchTask& task, const State& state, i
     auto pass_ctx = tvm::transform::PassContext::Current();
 
     auto mod = ScheduleToModule(sch, Array<ObjectRef>{tensors.begin(), tensors.end()}, name,
-                                std::unordered_map<te::Tensor, te::Buffer>(),
-                                GlobalVarSupply(NameSupply("")));
+                                std::unordered_map<te::Tensor, te::Buffer>(), GlobalVarSupply());
 
     bool disable_vectorize =
         pass_ctx->GetConfig<Bool>("tir.disable_vectorize", Bool(false)).value();
@@ -1399,6 +1403,11 @@ void GetPerStoreFeaturesWorkerFunc(const SearchTask& task, const State& state, i
       };
       pass_list.push_back(tir::transform::VerifyGPUCode(gpu_params));
       const auto& optimize = tir::transform::Sequential(pass_list);
+      optimize(mod);
+    }
+    if (IsHexagonTask(task)) {
+      Target target = task->target;
+      const auto& optimize = tir::transform::Sequential({tir::transform::VerifyVTCMLimit(target)});
       optimize(mod);
     }
     const auto& optimize =
@@ -1737,7 +1746,10 @@ TVM_REGISTER_GLOBAL("auto_scheduler.FeaturesFromPrimFunc")
       std::vector<float> vec;
       GetPerStoreFeature(func, cache_line_size, max_n_bufs, &vec, log_scale);
       int64_t num_feature_rows = vec[0];  // first element is number of rows
-      int64_t row_length = (vec.size() - 1) / num_feature_rows;
+      int64_t row_length = 0;
+      if (num_feature_rows != 0) {
+        row_length = (vec.size() - 1) / num_feature_rows;
+      }
       auto ary =
           runtime::NDArray::Empty({num_feature_rows, row_length}, {kDLFloat, 32, 1}, {kDLCPU, 0});
       // NDArray is row major by default

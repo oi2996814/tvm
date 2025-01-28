@@ -15,14 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 """An execution trace of a scheduling program"""
+import os
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from tvm._ffi import register_object as _register_object
 from tvm.runtime import Object
 
-from ...ir import Array, Map
+from ...ir import Array, Map, save_json
 from ...runtime import String
 from ..expr import FloatImm, IntImm
+from ..function import IndexMap
 from . import _ffi_api
 from .instruction import ATTR_TYPE, INPUT_RV_TYPE, Instruction
 
@@ -37,15 +39,20 @@ JSON_TYPE = Any
 def _json_from_tvm(obj):
     if obj is None:
         return None
-    if isinstance(obj, Array):
+    elif isinstance(obj, (bool, int, float, str)):
+        return obj
+    elif isinstance(obj, Array):
         return [_json_from_tvm(i) for i in obj]
-    if isinstance(obj, Map):
+    elif isinstance(obj, Map):
         return {_json_from_tvm(k): _json_from_tvm(v) for k, v in obj.items()}
-    if isinstance(obj, String):
+    elif isinstance(obj, String):
         return str(obj)
-    if isinstance(obj, (IntImm, FloatImm)):
+    elif isinstance(obj, (IntImm, FloatImm)):
         return obj.value
-    raise TypeError("Not supported type: " + str(type(obj)))
+    elif isinstance(obj, IndexMap):
+        return save_json(obj)
+    else:
+        raise TypeError("Not supported type: " + str(type(obj)))
 
 
 @_register_object("tir.Trace")
@@ -259,16 +266,28 @@ class Trace(Object):
         """
         _ffi_api.TraceApplyJSONToSchedule(json_obj, sch)  # type: ignore # pylint: disable=no-member
 
-    def show(self, style: Optional[str] = None) -> None:
-        """A sugar for print highlighted trace.
+    def show(self, style: Optional[str] = None, black_format: bool = False) -> None:
+        """A sugar for print highlighted TVM script.
 
         Parameters
         ----------
         style : str, optional
-            Pygments styles extended by "light" (default) and "dark", by default "light"
+
+            Pygmentize printing style, auto-detected if None.  See
+            `tvm.script.highlight.cprint` for more details.
+
+        black_format: bool
+
+            If true, use the formatter Black to format the TVMScript.
+            If None, determine based on the "TVM_BLACK_FORMAT" environment
+            variable.
         """
         from tvm.script.highlight import (  # pylint: disable=import-outside-toplevel
             cprint,
         )
 
-        cprint(str(self), style=style)
+        if black_format is None:
+            env = os.environ.get("TVM_BLACK_FORMAT")
+            black_format = bool(env and int(env))
+
+        cprint(str(self), style=style, black_format=black_format)

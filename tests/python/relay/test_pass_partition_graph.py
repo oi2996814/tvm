@@ -189,67 +189,6 @@ def check_result(
     check_graph_executor_result()
 
 
-def test_multi_node_compiler():
-    x = relay.var("x", shape=(10, 10))
-    w0 = relay.var("w0", shape=(10, 10))
-    w1 = relay.var("w1", shape=(10, 10))
-    w2 = relay.var("w2", shape=(10, 10))
-    w3 = relay.var("w3", shape=(10, 10))
-    w4 = relay.var("w4", shape=(10, 10))
-    w5 = relay.var("w5", shape=(10, 10))
-    w6 = relay.var("w6", shape=(10, 10))
-    w7 = relay.var("w7", shape=(10, 10))
-
-    # C compiler
-    # FIXME: We generate two compilers for this case but they should be merged to one
-    # due to the common input (x).
-    z0 = relay.add(x, w0)
-    p0 = relay.subtract(z0, w1)
-    q0 = relay.multiply(p0, w2)
-
-    z1 = relay.add(x, w3)
-    p1 = relay.subtract(z1, w4)
-    q1 = relay.multiply(p1, w5)
-
-    # Other parts on TVM
-    z2 = relay.add(x, w6)
-    q2 = relay.subtract(z2, w7)
-
-    r = relay.concatenate((q0, q1, q2), axis=0)
-    f = relay.Function([x, w0, w1, w2, w3, w4, w5, w6, w7], r)
-    mod = tvm.IRModule()
-    ann = byoc.CcompilerAnnotator()
-    mod["main"] = ann.visit(f)
-    mod = transform.PartitionGraph()(mod)
-    mod = transform.InferType()(mod)
-
-    x_data = np.random.rand(10, 10).astype("float32")
-    w_data = []
-    for _ in range(8):
-        w_data.append(np.random.rand(10, 10).astype("float32"))
-
-    map_inputs = {"w{}".format(i): w_data[i] for i in range(8)}
-    map_inputs["x"] = x_data
-
-    targets = [("llvm", Runtime("cpp")), ("c", Runtime("crt", {"system-lib": True}))]
-    for tgt, rt in targets:
-        check_result(
-            mod,
-            map_inputs,
-            (30, 10),
-            np.concatenate(
-                (
-                    ((x_data + w_data[0]) - w_data[1]) * w_data[2],
-                    ((x_data + w_data[3]) - w_data[4]) * w_data[5],
-                    x_data + w_data[6] - w_data[7],
-                ),
-                axis=0,
-            ),
-            target=tgt,
-            runtime=rt,
-        )
-
-
 def test_extern_ccompiler_single_op():
     @transform.function_pass(opt_level=0)
     class MyAnnotator:
@@ -327,7 +266,7 @@ def test_extern_ccompiler_default_ops():
     mod = transform.PartitionGraph()(mod)
     fused_mod = transform.FuseOps(2)(mod)
     expected_mod = expected()
-    assert tvm.ir.structural_equal(fused_mod, expected_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(fused_mod, expected_mod, map_free_vars=True)
 
     x_data = np.random.rand(8, 8).astype("float32")
     y_data = np.random.rand(8, 8).astype("float32")
@@ -376,7 +315,7 @@ def test_extern_compiler_sanitized_ops():
     mod = transform.PartitionGraph()(mod)
     fused_mod = transform.FuseOps(2)(mod)
     expected_mod = expected()
-    assert tvm.ir.structural_equal(fused_mod, expected_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(fused_mod, expected_mod, map_free_vars=True)
 
 
 def test_extern_ccompiler_multiple_functions():
@@ -451,7 +390,7 @@ def test_extern_ccompiler_multiple_functions():
 
     fused_mod = transform.FuseOps(2)(mod)
     expected_mod = expected()
-    assert tvm.ir.structural_equal(fused_mod, expected_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(fused_mod, expected_mod, map_free_vars=True)
 
     x_data = np.random.rand(8, 8).astype("float32")
     y_data = np.random.rand(8, 8).astype("float32")
@@ -529,7 +468,7 @@ def test_extern_dnnl():
     mod = transform.PartitionGraph()(mod)
     mod = transform.InferType()(mod)
 
-    assert tvm.ir.structural_equal(mod, expected(), map_free_vars=True)
+    tvm.ir.assert_structural_equal(mod, expected(), map_free_vars=True)
 
     ref_mod = tvm.IRModule()
     ref_mod["main"] = get_func()
@@ -650,7 +589,7 @@ def test_function_lifting():
 
     partitioned = partition()
     ref_mod = expected()
-    assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 
 def test_function_lifting_inline():
@@ -712,7 +651,7 @@ def test_function_lifting_inline():
 
     partitioned = partition()
     ref_mod = expected()
-    assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 
 def test_constant_propagation():
@@ -751,7 +690,7 @@ def test_constant_propagation():
 
     expected_mod = expected()
     expected_mod = relay.transform.InferType()(expected_mod)
-    assert tvm.ir.structural_equal(mod, expected_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(mod, expected_mod, map_free_vars=True)
 
     y_data = np.random.rand(8, 8).astype("float32")
     np_add = ones + y_data
@@ -847,7 +786,7 @@ def test_multiple_outputs():
     mod["main"] = create_graph()
     ref_mod = expected()
     partitioned = transform.PartitionGraph()(mod)
-    assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 
 def test_mixed_single_multiple_outputs():
@@ -914,7 +853,7 @@ def test_mixed_single_multiple_outputs():
     ref_mod = expected()
 
     partitioned = transform.PartitionGraph()(mod)
-    assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 
 def test_dnnl_fuse():
@@ -1201,7 +1140,7 @@ def test_multiple_use_of_an_output():
         mod = transform.PartitionGraph()(mod)
 
         expected_mod = expected_same_output_region()
-        assert tvm.ir.structural_equal(mod, expected_mod, map_free_vars=True)
+        tvm.ir.assert_structural_equal(mod, expected_mod, map_free_vars=True)
 
     def test_different_output_region():
         mod = get_mod()
@@ -1210,7 +1149,7 @@ def test_multiple_use_of_an_output():
         mod = transform.PartitionGraph()(mod)
 
         expected_mod = expected_different_output_region()
-        assert tvm.ir.structural_equal(mod, expected_mod, map_free_vars=True)
+        tvm.ir.assert_structural_equal(mod, expected_mod, map_free_vars=True)
 
     test_same_output_region()
     test_different_output_region()
@@ -1274,7 +1213,7 @@ def test_duplicate_outputs():
 
     ref_mod = expected()
     partitioned = seq(mod)
-    assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 
 def test_duplicate_merge_and_tuplegetitem():
@@ -1357,7 +1296,7 @@ def test_duplicate_merge_and_tuplegetitem():
 
     ref_mod = expected()
     partitioned = seq(mod)
-    assert tvm.ir.structural_equal(partitioned, ref_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, ref_mod, map_free_vars=True)
 
 
 def test_constant_tuples():
@@ -1477,7 +1416,7 @@ def test_flatten_tuple_output():
     partitioned = seq(create_graph())
     partitioned = transform.InferType()(partitioned)
     expected_mod = transform.InferType()(expected())
-    assert tvm.ir.structural_equal(partitioned, expected_mod, map_free_vars=True)
+    tvm.ir.assert_structural_equal(partitioned, expected_mod, map_free_vars=True)
 
 
 def test_tuple_output_exec():

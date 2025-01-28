@@ -155,22 +155,24 @@ std::vector<std::vector<Stmt>> MakeLoopNest(const Stage& stage,
       ICHECK(is_zero(dom->min));
       ICHECK(is_positive_const(dom->extent));
       // annotate the extent of the IterVar
-      nest[i + 1].emplace_back(AttrStmt(bind_iv, tir::attr::virtual_thread, dom->extent, no_op));
+      nest[i + 1].emplace_back(AttrStmt(bind_iv, tir::attr::virtual_thread,
+                                        cast(bind_iv->var.dtype(), dom->extent), no_op));
       value_map[iv] = promote_to_iv_dtype(var);
     } else if (bind_iv->thread_tag == "pipeline") {
       // pipeline marker.
       ICHECK(is_zero(dom->min));
       ICHECK(is_one(dom->extent));
       // annotate the extent of the IterVar
-      nest[i + 1].emplace_back(
-          AttrStmt(bind_iv, tir::attr::pipeline_exec_scope, dom->extent, no_op));
+      nest[i + 1].emplace_back(AttrStmt(bind_iv, tir::attr::pipeline_exec_scope,
+                                        cast(bind_iv->var.dtype(), dom->extent), no_op));
       value_map[iv] = dom->min;
     } else {
       // Always restrict threaded IterVar to starts from 0.
       ICHECK(is_zero(dom->min)) << "Itervar " << iv << " must start at zero, but it starts at "
                                 << dom->min;
       // annotate the extent of the IterVar
-      nest[i + 1].emplace_back(AttrStmt(bind_iv, tir::attr::thread_extent, dom->extent, no_op));
+      nest[i + 1].emplace_back(AttrStmt(bind_iv, tir::attr::thread_extent,
+                                        cast(bind_iv->var.dtype(), dom->extent), no_op));
       if (!debug_keep_trivial_loop && is_one(dom->extent)) {
         value_map[iv] = dom->min;
       } else if (stage->scope == "") {
@@ -252,22 +254,6 @@ PrimExpr ReplaceTensor(PrimExpr expr, const std::unordered_map<Tensor, Tensor>& 
   TensorReplacer repl(replace);
   PrimExpr ret = repl(expr);
   return repl.found ? ret : expr;
-}
-
-Stmt Substitute(Stmt s, const std::unordered_map<IterVar, PrimExpr>& value_map) {
-  std::unordered_map<const VarNode*, PrimExpr> init;
-  for (const auto& kv : value_map) {
-    init[kv.first->var.get()] = kv.second;
-  }
-  return tir::Substitute(s, init);
-}
-
-PrimExpr Substitute(PrimExpr s, const std::unordered_map<IterVar, PrimExpr>& value_map) {
-  std::unordered_map<const VarNode*, PrimExpr> init;
-  for (const auto& kv : value_map) {
-    init[kv.first->var.get()] = kv.second;
-  }
-  return tir::Substitute(s, init);
 }
 
 IterVarType ForKindToIterVarType(tir::ForKind kind) {

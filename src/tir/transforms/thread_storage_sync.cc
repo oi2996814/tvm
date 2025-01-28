@@ -50,11 +50,27 @@ class ThreadSyncPlanner : public StorageAccessVisitor {
   }
   // Plan the sync
   std::vector<AccessEntry> Summarize(std::vector<StmtEntry> seq, const ForNode* loop) final {
+    // Redirect all "shared.dyn" buffer access to the same buffer var
+    // so that the accesses can be planned together.
+    Var shared_dyn_buf;
+    for (StmtEntry& entry : seq) {
+      for (AccessEntry& access : entry.access) {
+        if (access.scope.rank == StorageRank::kShared && access.scope.tag == ".dyn" &&
+            access.buffer.defined()) {
+          if (!shared_dyn_buf.defined()) {
+            shared_dyn_buf = access.buffer;
+          } else {
+            access.buffer = shared_dyn_buf;
+          }
+        }
+      }
+    }
+
     // Unsynced reads and writes
     std::vector<AccessEntry> reads;
     std::vector<AccessEntry> writes;
     // if it is a loop, rotate two times to consider effect of loop.
-    // simulation based approach to find dependenceies
+    // simulation based approach to find dependencies
     for (size_t i = 0; i < seq.size(); ++i) {
       const StmtEntry& s = seq[i];
       // check if sync before statement is needed.
@@ -197,20 +213,39 @@ class ThreadSyncPlanner : public StorageAccessVisitor {
     // Same index value means no conflicts
     // TODO(tqchen) more standard set based testing.
     bool has_same_index = true;
+    // Even if access has the same index, those indices need to
+    // depend on the innermost thread id to avoid race condition
+    bool depends_on_thread_index = true;
+    const VarNode* thread_index_var = nullptr;
+    if (!curr.threads.empty()) {
+      thread_index_var = curr.threads.back()->var.get();
+    }
+
     for (size_t i = 0; i < prev.touched.size(); i++) {
       const auto& prev_intset = prev.touched[i];
       const auto& curr_intset = curr.touched[i];
 
-      bool provably_same_index =
-          prev_intset.IsSinglePoint() && curr_intset.IsSinglePoint() &&
-          ExprDeepEqual()(prev_intset.PointValue(), curr_intset.PointValue());
-
-      if (!provably_same_index) {
+      if (prev_intset.IsSinglePoint() && curr_intset.IsSinglePoint()) {
+        PrimExpr prev_index = prev_intset.PointValue();
+        PrimExpr curr_index = curr_intset.PointValue();
+        has_same_index = ExprDeepEqual()(prev_index, curr_index);
+        if (thread_index_var != nullptr) {
+          auto f_uses_thread_index = [=](const tvm::tir::VarNode* parameter) {
+            return parameter == thread_index_var;
+          };
+          depends_on_thread_index = depends_on_thread_index &&
+                                    UsesVar(curr_index, f_uses_thread_index) &&
+                                    UsesVar(prev_index, f_uses_thread_index);
+        }
+      } else {
         has_same_index = false;
+      }
+
+      if (!(has_same_index && depends_on_thread_index)) {
         break;
       }
     }
-    if (has_same_index) {
+    if (has_same_index && depends_on_thread_index) {
       return false;
     }
 
@@ -295,15 +330,6 @@ class ThreadSyncInserter : public StmtExprMutator {
       return StmtExprMutator::VisitStmt(stmt);
     }
   }
-  PrimExpr VisitExpr_(const LoadNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
-    return PrimExpr();
-  }
-
-  Stmt VisitStmt_(const StoreNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
-    return Stmt();
-  }
   PrimExpr VisitExpr_(const BufferLoadNode* op) final {
     if (sync_scope_.rank == StorageRank::kGlobal &&
         GetScope(op->buffer->data).rank == StorageRank::kGlobal) {
@@ -343,7 +369,7 @@ class ThreadSyncInserter : public StmtExprMutator {
       PrimExpr expr = StmtExprMutator::VisitExpr_(op);
       op = expr.as<CallNode>();
       ICHECK_EQ(op->args.size(), 5U);
-      Var buffer_var(GetRef<Var>(op->args[1].as<VarNode>()));
+      Var buffer_var(Downcast<Var>(op->args[1]));
       const IntImmNode* flag = op->args[4].as<IntImmNode>();
       if ((flag->value & 1) && sync_scope_.rank == StorageRank::kGlobal &&
           GetScope(buffer_var).rank == StorageRank::kGlobal) {
@@ -414,7 +440,7 @@ class ThreadSyncInserter : public StmtExprMutator {
   StorageScope sync_scope_;
   const std::unordered_set<const Object*>& syncs_;
   // The read write statistics of storage
-  std::unordered_map<Var, Entry, ObjectPtrHash, ObjectPtrEqual> rw_stats_;
+  std::unordered_map<Var, Entry> rw_stats_;
   // The statistics for global barrier
   bool in_thread_env_{false};
   // memorized results

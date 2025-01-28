@@ -106,7 +106,7 @@ class CostModel(Object):
 
     @staticmethod
     def create(
-        kind: Literal["xgb", "mlp", "random"],
+        kind: Literal["xgb", "mlp", "random", "none"],
         *args,
         **kwargs,
     ) -> "CostModel":
@@ -114,8 +114,8 @@ class CostModel(Object):
 
         Parameters
         ----------
-        kind : Literal["xgb", "mlp", "random"]
-            The kind of the cost model. Can be "xgb", "mlp", or "random".
+        kind : Literal["xgb", "mlp", "random", "none"]
+            The kind of the cost model. Can be "xgb", "mlp", "random" or "none".
 
         Returns
         -------
@@ -126,6 +126,14 @@ class CostModel(Object):
 
         if kind == "xgb":
             return XGBModel(*args, **kwargs)  # type: ignore
+
+        # params only relevant to XGBModel
+        _xgb_params = ["num_tuning_cores", "tree_method"]
+
+        for param in _xgb_params:
+            if param in kwargs:
+                kwargs.pop(param)
+
         if kind == "random":
             return RandomModel(*args, **kwargs)  # type: ignore
         if kind == "mlp":
@@ -134,6 +142,8 @@ class CostModel(Object):
             )
 
             return MLPModel(*args, **kwargs)  # type: ignore
+        if kind == "none":
+            return None  # no cost model required
         raise ValueError(f"Unknown CostModel: {kind}")
 
 

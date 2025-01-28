@@ -25,11 +25,14 @@ from . import (
     mutator,
     postproc,
     relay_integration,
+    relax_integration,
     runner,
+    schedule,
     schedule_rule,
     search_strategy,
     space_generator,
     tir_integration,
+    trace_apply,
 )
 from .builder import Builder
 from .cost_model import CostModel
@@ -40,10 +43,7 @@ from .measure_callback import MeasureCallback
 from .mutator import Mutator
 from .postproc import Postproc
 from .profiler import Profiler
-from .relay_integration import (
-    is_meta_schedule_dispatch_enabled,
-    is_meta_schedule_enabled,
-)
+from .relay_integration import is_meta_schedule_enabled
 from .runner import Runner
 from .schedule_rule import ScheduleRule
 from .search_strategy import MeasureCandidate, SearchStrategy

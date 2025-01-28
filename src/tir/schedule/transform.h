@@ -54,6 +54,14 @@ Block WithAnnotation(const BlockNode* block, const String& attr_key, const Objec
 Buffer WithScope(const Buffer& buffer, const String& scope);
 
 /*!
+ * \brief Create a new buffer by changint the data type.
+ * \param buffer The given buffer.
+ * \param scope The target data type.
+ * \return The new buffer with target data type.
+ */
+Buffer WithDType(const Buffer& buffer, const DataType& dtype);
+
+/*!
  * \brief Replaces the buffer within the specific sequence of regions
  * \param regions The regions whose buffers are to be replaced
  * \param source The buffer to be replaced
@@ -62,6 +70,15 @@ Buffer WithScope(const Buffer& buffer, const String& scope);
  */
 Array<BufferRegion> ReplaceBuffer(Array<BufferRegion> regions, const Buffer& source,
                                   const Buffer& target);
+
+/*!
+ * \brief Replaces the buffer within the specific sequence of regions
+ * \param regions The regions whose buffers are to be replaced
+ * \param buffer_map The mapping from old buffers to new buffers
+ * \return The new sequence of regions after replacement
+ */
+Array<BufferRegion> ReplaceBuffer(Array<BufferRegion> regions,
+                                  const Map<Buffer, Buffer>& buffer_map);
 
 /*!
  * \brief Replaces the buffer within the specific sequence of match_buffers
@@ -131,9 +148,9 @@ class ReplaceBufferMutator : public StmtExprMutator {
     return node;
   }
 
-  Stmt VisitStmt_(const BufferStoreNode* op) final;
+  Stmt VisitStmt_(const BufferStoreNode* op) override;
 
-  PrimExpr VisitExpr_(const BufferLoadNode* op) final;
+  PrimExpr VisitExpr_(const BufferLoadNode* op) override;
 
   virtual MatchBufferRegion VisitMatchBufferRegion(const MatchBufferRegion& match_buffer);
 

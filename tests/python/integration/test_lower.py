@@ -22,7 +22,8 @@ import tvm.testing
 from tvm.script import tir as T
 
 
-@T.prim_func
+# complains that index_i is defined outside of a block
+@T.prim_func(check_well_formed=False)
 def tensorcore_gemm(handle_a: T.handle, handle_b: T.handle, handle_c: T.handle) -> None:
     # pylint: disable=missing-function-docstring
     # match buffer
@@ -136,8 +137,8 @@ def tensorcore_gemm(handle_a: T.handle, handle_b: T.handle, handle_c: T.handle) 
                                                 axis_vk * 16 : axis_vk * 16 + 16,
                                             ]
                                         )
-                                        stride0 = T.var("int32")
-                                        stride1 = T.var("int32")
+                                        stride0 = T.int32()
+                                        stride1 = T.int32()
                                         match_buffer_a0 = T.match_buffer(
                                             shared_a[
                                                 new_axis_vi * 16 : new_axis_vi * 16 + 16,
@@ -198,8 +199,8 @@ def tensorcore_gemm(handle_a: T.handle, handle_b: T.handle, handle_c: T.handle) 
                                                 axis_vk * 16 : axis_vk * 16 + 16,
                                             ]
                                         )
-                                        stride0 = T.var("int32")
-                                        stride1 = T.var("int32")
+                                        stride0 = T.int32()
+                                        stride1 = T.int32()
                                         match_buffer_b0 = T.match_buffer(
                                             shared_b[
                                                 new_axis_vj * 16 : new_axis_vj * 16 + 16,
@@ -335,8 +336,8 @@ def tensorcore_gemm(handle_a: T.handle, handle_b: T.handle, handle_c: T.handle) 
                                         new_axis_vj * 16 : new_axis_vj * 16 + 16,
                                     ]
                                 )
-                                stride0 = T.var("int32")
-                                stride1 = T.var("int32")
+                                stride0 = T.int32()
+                                stride1 = T.int32()
                                 wmma_c2 = T.match_buffer(
                                     wmma_c[
                                         new_axis_vi * 16 : new_axis_vi * 16 + 16,

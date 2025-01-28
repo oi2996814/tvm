@@ -65,8 +65,8 @@ class CSRNDArray(object):
             self.shape = source_array.shape
         else:
             raise RuntimeError(
-                "Construct CSRNDArray with either a tuple (data, indices, indptr) "
-                "or a numpy.array, can't handle type %s." % (type(arg1),)
+                f"Construct CSRNDArray with either a tuple (data, indices, indptr) "
+                f"or a numpy.array, can't handle type {type(arg1)}."
             )
         self.stype = "csr"
         self.dtype = self.data.dtype
@@ -95,7 +95,7 @@ class CSRNDArray(object):
         """Construct a full matrix and convert it to numpy array."""
         full = _np.zeros(self.shape, self.dtype)
         ridx = _np.diff(self.indptr.numpy())
-        ridx = _np.hstack((_np.ones((v,), itype) * i for i, v in enumerate(ridx)))
+        ridx = _np.hstack([_np.ones((v,), itype) * i for i, v in enumerate(ridx)])
         full[ridx, self.indices.numpy().astype(itype)] = self.data.numpy()
         return full
 
@@ -106,7 +106,7 @@ def array(source_array, device=None, shape=None, stype="csr"):
     if stype == "csr":
         ret = CSRNDArray(source_array, shape=shape, device=device)
     else:
-        raise NotImplementedError("stype=%s is not supported yet." % (stype,))
+        raise NotImplementedError(f"stype={stype} is not supported yet.")
     return ret
 
 
@@ -200,5 +200,5 @@ def placeholder(shape, nonzeros=None, dtype=None, name="placeholder", stype=None
     if stype == "csr":
         ret = CSRPlaceholderOp(shape=shape, nonzeros=nonzeros, dtype=dtype, name=name)
     else:
-        raise NotImplementedError("stype=%s is not supported yet." % (stype,))
+        raise NotImplementedError(f"stype={stype} is not supported yet.")
     return ret

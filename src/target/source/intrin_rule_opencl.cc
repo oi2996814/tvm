@@ -31,6 +31,9 @@ namespace codegen {
 namespace intrin {
 using tir::FLowerIntrinsic;
 
+TVM_REGISTER_OP("tir.clz").set_attr<FLowerIntrinsic>("opencl.FLowerIntrinsic",
+                                                     DispatchPureExtern<Direct>);
+
 TVM_REGISTER_OP("tir.floor")
     .set_attr<FLowerIntrinsic>("opencl.FLowerIntrinsic", DispatchPureExtern<Direct>);
 
@@ -44,6 +47,9 @@ TVM_REGISTER_OP("tir.fabs")
     .set_attr<FLowerIntrinsic>("opencl.FLowerIntrinsic", DispatchPureExtern<Direct>);
 
 TVM_REGISTER_OP("tir.round")
+    .set_attr<FLowerIntrinsic>("opencl.FLowerIntrinsic", DispatchPureExtern<Direct>);
+
+TVM_REGISTER_OP("tir.nearbyint")
     .set_attr<FLowerIntrinsic>("opencl.FLowerIntrinsic", DispatchPureExtern<Direct>);
 
 TVM_REGISTER_OP("tir.exp").set_attr<FLowerIntrinsic>("opencl.FLowerIntrinsic",

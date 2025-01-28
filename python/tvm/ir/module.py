@@ -15,19 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 """IRModule that holds the functions and type definitions."""
-from typing import Optional
 
-from tvm._ffi.base import string_types
+from __future__ import annotations
+
+from typing import Dict, Union
+
 import tvm._ffi
+from tvm._ffi.base import string_types
+from tvm.runtime import Scriptable
+from tvm.runtime.object import Object
 
-from .base import Node
+from . import _ffi_api
 from . import expr as _expr
 from . import type as _ty
-from . import _ffi_api
+from .attrs import DictAttrs
+from .base import Node
 
 
 @tvm._ffi.register_object("IRModule")
-class IRModule(Node):
+class IRModule(Node, Scriptable):
     """IRModule that holds functions and type definitions.
 
     IRModule is the basic unit for all IR transformations across the stack.
@@ -38,7 +44,7 @@ class IRModule(Node):
         Map of global var to BaseFunc
     """
 
-    def __init__(self, functions=None, type_definitions=None):
+    def __init__(self, functions=None, type_definitions=None, attrs=None, global_infos=None):
         if functions is None:
             functions = {}
         elif isinstance(functions, dict):
@@ -61,7 +67,34 @@ class IRModule(Node):
                     raise TypeError("Expect type_definitions to be Dict[GlobalTypeVar, Type]")
                 mapped_type_defs[k] = v
             type_definitions = mapped_type_defs
-        self.__init_handle_by_constructor__(_ffi_api.IRModule, functions, type_definitions)
+
+        attrs = None if not attrs else attrs
+        if attrs is not None:
+            attrs = tvm.ir.make_node("DictAttrs", **attrs)
+        if global_infos is None:
+            global_infos = {}
+        self.__init_handle_by_constructor__(
+            _ffi_api.IRModule,
+            functions,
+            type_definitions,
+            attrs,
+            global_infos,
+        )
+
+    def clone(self) -> "IRModule":
+        return _ffi_api.Module_Clone(self)
+
+    def functions_items(self):
+        """Get items in self.functions.items() in alphabetical order.
+
+        Returns
+        -------
+        items: List[Tuple[GlobalVar, Function]]
+            The functions items.
+        """
+        items = list(self.functions.items())
+        items.sort(key=lambda item: str(item[0].name_hint))
+        return items
 
     def __setitem__(self, var, val):
         """Add a mapping to the module.
@@ -109,6 +142,12 @@ class IRModule(Node):
             return _ffi_api.Module_Lookup(self, var)
         return _ffi_api.Module_LookupDef(self, var)
 
+    def __delitem__(self, var: Union[str, _expr.GlobalVar]):
+        _ffi_api.Module_Remove(self, var)
+
+    def __contains__(self, var: Union[str, _expr.GlobalVar]) -> bool:
+        return _ffi_api.Module_Contains(self, var)
+
     def update(self, other):
         """Insert functions in another Module to current one.
 
@@ -135,6 +174,19 @@ class IRModule(Node):
             The function to be inserted.
         """
         return _ffi_api.Module_UpdateFunction(self, var, func)
+
+    def update_global_info(self, name, global_info):
+        """Update global info in the module
+
+        Parameters
+        ----------
+        name: str
+            The name for the global info.
+
+        global_info: List[GlobalInfo]
+            The global info to be updated.
+        """
+        return _ffi_api.Module_UpdateGlobalInfo(self, name, global_info)
 
     def get_global_var(self, name):
         """Get a global variable in the function by name.
@@ -164,6 +216,33 @@ class IRModule(Node):
             An array of global vars.
         """
         return _ffi_api.Module_GetGlobalVars(self)
+
+    def replace_global_vars(
+        self,
+        replacements: Dict[Union[str, _expr.GlobalVar], Union[str, _expr.GlobalVar]],
+    ) -> "IRModule":
+        """Replace GlobalVar instances within the module
+
+        Replace GlobalVars within the IRModule.  Since the IRModule
+        may contain internal references to a GlobalVar, either in TIR
+        or in Relax, this method should be used whenever replacing or
+        renaming a GlobalVar.
+
+        Parameters
+        ----------
+        replacements: Dict[Union[str, _expr.GlobalVar], Union[str, _expr.GlobalVar]]
+
+            A dictionary where each key is a GlobalVar to be replaced,
+            and the corresponding value is the GlobalVar with which to
+            replace it.
+
+        Returns
+        -------
+        IRModule
+            The updated module
+
+        """
+        return _ffi_api.Module_ReplaceGlobalVars(self, replacements)
 
     def get_global_type_vars(self):
         """Collect all global type vars defined in this module.
@@ -252,45 +331,6 @@ class IRModule(Node):
         _ffi_api.Module_ImportFromStd(self, file_to_import)
         return tvm.relay.transform.InferType()(self)
 
-    def __str__(self):
-        return _ffi_api.PrettyPrint(self)
-
-    def __repr__(self):
-        return self.astext()
-
-    def script(self, tir_prefix: str = "T", show_meta: bool = False) -> str:
-        """Print IRModule into TVMScript
-
-        Parameters
-        ----------
-        tir_prefix : str
-            The tir namespace prefix
-
-        show_meta : bool
-            Whether to show meta information
-
-        Returns
-        -------
-        script : str
-            The TVM Script of the IRModule
-        """
-        return tvm._ffi.get_global_func("script.AsTVMScript")(
-            self, tir_prefix, show_meta
-        )  # type: ignore
-
-    def show(self, style: Optional[str] = None) -> None:
-        """
-        A sugar for print highlighted TVM script.
-        Parameters
-        ----------
-        style : str, optional
-            Pygments styles extended by "light" (default) and "dark", by default "light"
-        """
-        from tvm.script.highlight import cprint  # pylint: disable=import-outside-toplevel
-
-        # Use deferred import to avoid circular import while keeping cprint under tvm/script
-        cprint(self, style=style)
-
     def get_attr(self, attr_key):
         """Get the IRModule attribute.
 
@@ -325,3 +365,61 @@ class IRModule(Node):
         """
 
         return _ffi_api.Module_WithAttr(self, attr_key, attr_value)
+
+    def without_attr(self, attr_key: str) -> "IRModule":
+        """Copy the IRModule and remove an attribute key and its associated value.
+        Parameters
+        ----------
+        attr_key : str
+            The attribute key.
+        Returns
+        -------
+        mod : IRModule
+            A new copy of the IRModule without the attribute
+        """
+
+        return _ffi_api.Module_WithoutAttr(self, attr_key)
+
+    def with_attrs(self, attr_map: Union[DictAttrs, Dict[str, Object]]) -> "IRModule":
+        """Copy the IRModule and add the given attribute map to it.
+        Parameters
+        ----------
+        attr_map: Union[DictAttrs, Dict[str, Object]]
+            The attribute map
+        Returns
+        -------
+        mod : IRModule
+            A new copy of the IRModule with the attribute
+        """
+        if isinstance(attr_map, tvm.ir.DictAttrs):
+            attr_map = attr_map._dict()
+
+        return _ffi_api.Module_WithAttrs(self, attr_map)
+
+    def astext(self, show_meta_data=True, annotate=None):
+        """Get the text format of the expression.
+
+        Parameters
+        ----------
+        show_meta_data : bool
+            Whether to include meta data section in the text
+            if there is meta data.
+
+        annotate: Optional[Object->str]
+            Optionally annotate function to provide additional
+            information in the comment block.
+
+        Returns
+        -------
+        text : str
+            The text format of the expression.
+
+        Notes
+        -----
+        The meta data section is necessary to fully parse the text format.
+        However, it can contain dumps that are big (e.g constant weights),
+        so it can be helpful to skip printing the meta data section.
+        """
+        from tvm.relay import astext  # pylint: disable=import-outside-toplevel
+
+        return astext(self, show_meta_data, annotate)
