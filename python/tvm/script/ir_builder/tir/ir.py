@@ -14,49 +14,87 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=missing-docstring
 """IRBuilder for TIR"""
 
-import inspect
 import functools
+import inspect
 from numbers import Integral
-from typing import Any, Callable, Dict, List, Optional, Union, Tuple
+import sys
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# isort: off
+from typing_extensions import Literal
+
+# isort: on
+
 import numpy as np  # type: ignore
 
-from tvm.ir import Range, Type
-from tvm.runtime import convert, ndarray
+from tvm import tir
+from tvm import ir
+from tvm.ir import Type
+from tvm.ir.base import deprecated
+from tvm.runtime import String, convert, ndarray
+from tvm.target import Target
+
+# pylint: disable=unused-import
 from tvm.target.codegen import llvm_lookup_intrinsic_id
-from tvm.tir import (
-    Buffer,
+from tvm.tir import Buffer, BufferRegion, IndexMap, PrimExpr
+from tvm.tir import op as _tir_op
+from tvm.tir import type_annotation
+
+# import tir.expr for direct ir construction to pass structural_equal comparison
+from tvm.tir.expr import (
+    EQ,
+    GE,
+    GT,
+    LE,
+    LT,
+    NE,
+    Add,
+    And,
+    Broadcast,
     BufferLoad,
-    BufferRegion,
+    Call,
+    CallEffectKind,
     Cast,
     CommReducer,
+    Div,
+    FloatImm,
+    FloorDiv,
+    FloorMod,
     IntImm,
     IterVar,
-    Let,
-    PrimExpr,
+    Max,
+    Min,
+    Mod,
+    Mul,
+    Not,
+    Or,
+    ProducerLoad,
+    Ramp,
+    Reduce,
     Select,
     Shuffle,
+    SizeVar,
     StringImm,
-    type_annotation,
+    Sub,
     Var,
 )
-from tvm.tir import Broadcast as broadcast
-from tvm.tir import Ramp as ramp
-from tvm.tir import op as _tir_op
 from tvm.tir.generic import cast
 
 from . import _ffi_api, frame
+from .external_kernel import call_kernel
+
+# pylint: enable=unused-import
 
 
-def buffer_decl(
+def buffer(
     shape: Union[List[PrimExpr], Tuple[PrimExpr], PrimExpr, Integral],
     dtype: str = "float32",
     data: Var = None,
     strides: List[PrimExpr] = None,
     elem_offset: PrimExpr = None,
-    scope: str = "",
+    scope: str = "global",
     align: int = 0,
     offset_factor: int = 0,
     buffer_type: str = "",
@@ -102,7 +140,11 @@ def buffer_decl(
         The declared buffer.
     """
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
-    return _ffi_api.BufferDecl(  # type: ignore[attr-defined] # pylint: disable=no-member
+    if strides is not None:
+        strides = [Var(s, "int32") if isinstance(s, str) else s for s in strides]
+    else:
+        strides = []
+    return _ffi_api.Buffer(  # type: ignore[attr-defined] # pylint: disable=no-member
         shape,
         dtype,
         "",
@@ -117,15 +159,27 @@ def buffer_decl(
     )
 
 
-def prim_func() -> frame.PrimFuncFrame:
+@deprecated("T.buffer_decl(...)", "T.Buffer(...)")
+def buffer_decl(*args, **kwargs):
+    return buffer(*args, **kwargs)
+
+
+def prim_func(is_private: bool = False) -> frame.PrimFuncFrame:
     """The primitive function statement.
+
+    Parameters
+    ----------
+    is_private : bool
+        Whether the PrimFunc is annotated as private
+        (if yes, it does not have a global symbol assigned;
+        otherwise, the global symbol is the PrimFunc's name)
 
     Returns
     -------
     res : frame.PrimFuncFrame
         The PrimFuncFrame.
     """
-    return _ffi_api.PrimFunc()  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.PrimFunc(is_private)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def arg(name: str, obj: Union[Var, Buffer]) -> Union[Var, Buffer]:
@@ -187,7 +241,7 @@ def func_ret(ret_type: Type) -> Type:
 
 def match_buffer(
     param: Union[Var, BufferLoad, BufferRegion],
-    shape: Union[List[PrimExpr], Tuple[PrimExpr], PrimExpr, Integral],
+    shape: Union[List[PrimExpr], Tuple[PrimExpr], PrimExpr, Integral] = None,
     dtype: str = "float32",
     data: Var = None,
     strides: List[PrimExpr] = None,
@@ -256,79 +310,20 @@ def match_buffer(
     res : Buffer
         The matched buffer.
     """
+    if shape is None:
+        if isinstance(param, BufferRegion):
+            dtype = param.buffer.dtype
+            shape = [region.extent for region in param.region]
+        else:
+            raise ValueError("Shape must be specified when binding input param")
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
-    if strides is None:
+    if strides is not None:
+        idx_dtype = shape[0].dtype if isinstance(shape[0], PrimExpr) else "int32"
+        strides = [Var(s, idx_dtype) if isinstance(s, str) else s for s in strides]
+    else:
         strides = []
     return _ffi_api.MatchBuffer(  # type: ignore[attr-defined] # pylint: disable=no-member
         param,
-        shape,
-        dtype,
-        data,
-        strides,
-        elem_offset,
-        scope,
-        align,
-        offset_factor,
-        buffer_type,
-        axis_separators,
-    )
-
-
-def preflattened_buffer(
-    postflattened: Buffer,
-    shape: Union[List[PrimExpr], Tuple[PrimExpr], PrimExpr, Integral],
-    dtype: str = "float32",
-    data: Var = None,
-    strides: List[PrimExpr] = None,
-    elem_offset: PrimExpr = None,
-    scope: str = "global",
-    align: int = -1,
-    offset_factor: int = 0,
-    buffer_type: str = "default",
-    axis_separators: List[int] = None,
-) -> None:
-    """The pre-flattened buffer statement.
-
-    Parameters
-    ----------
-    postflattened : Buffer
-        The original buffer to be flattened.
-
-    shape : Union[List[PrimExpr], Tuple[PrimExpr], PrimExpr, Integral]
-        The type of the buffer prior to flattening.
-
-    dtype : str
-        The data type in the content of the buffer.
-
-    data : Var
-        The pointer to the head of the data.
-
-    strides : List[PrimExpr]
-        The strides of each dimension.
-
-    elem_offset : PrimExpr
-        The offset in terms of number of dtype elements (including lanes).
-
-    scope : str
-        The optional storage scope of buffer data pointer.
-
-    align : int
-        The alignment requirement of data pointer in bytes.
-
-    offset_factor : int
-        The factor of elem_offset field.
-
-    buffer_type : str
-        The buffer type.
-
-    axis_separators : List[int]
-        The separators between input axes when generating flattened output axes.
-    """
-    shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
-    if strides is None:
-        strides = []
-    _ffi_api.PreflattenedBuffer(  # type: ignore[attr-defined] # pylint: disable=no-member
-        postflattened,
         shape,
         dtype,
         data,
@@ -447,7 +442,7 @@ def alloc_buffer(
     data: Var = None,
     strides: List[PrimExpr] = None,
     elem_offset: PrimExpr = None,
-    scope: str = "",
+    scope: str = "global",
     align: int = -1,
     offset_factor: int = 0,
     buffer_type: str = "default",
@@ -493,7 +488,9 @@ def alloc_buffer(
         The allocated buffer.
     """
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
-    if strides is None:
+    if strides is not None:
+        strides = [Var(s, "int32") if isinstance(s, str) else s for s in strides]
+    else:
         strides = []
     return _ffi_api.AllocBuffer(  # type: ignore[attr-defined] # pylint: disable=no-member
         shape,
@@ -509,7 +506,7 @@ def alloc_buffer(
     )
 
 
-def _as_range(dom: Union[Range, List[PrimExpr]]) -> Range:
+def _as_range(dom: Union[ir.Range, List[PrimExpr]]) -> ir.Range:
     """The range constructor.
 
     Parameters
@@ -522,17 +519,28 @@ def _as_range(dom: Union[Range, List[PrimExpr]]) -> Range:
     res : Range
         The Range.
     """
-    if isinstance(dom, Range):
+    if isinstance(dom, ir.Range):
         return dom
     if isinstance(dom, (list, tuple)):
-        return Range(dom[0], dom[1])
-    return Range(0, dom)
+        from tvm.arith import Analyzer  # pylint: disable=import-outside-toplevel
+
+        extent = Analyzer().simplify(dom[1] - dom[0])
+        if isinstance(extent, tir.IntImm):
+            return ir.Range.from_min_extent(dom[0], extent)
+        return ir.Range(dom[0], dom[1])
+    if hasattr(dom, "dtype"):
+        return ir.Range(IntImm(dom.dtype, 0), dom)
+    return ir.Range(0, dom)
 
 
 class axis:  # pylint: disable=invalid-name
+    """The axis class"""
+
     @staticmethod
     def spatial(
-        dom: Union[Range, List[PrimExpr], Tuple[PrimExpr]], binding: PrimExpr, dtype: str = "int32"
+        dom: Union[ir.Range, List[PrimExpr], Tuple[PrimExpr]],
+        binding: PrimExpr,
+        dtype: str = "int32",
     ) -> Var:
         """The spatial block axis defining function.
 
@@ -558,7 +566,9 @@ class axis:  # pylint: disable=invalid-name
 
     @staticmethod
     def reduce(
-        dom: Union[Range, List[PrimExpr], Tuple[PrimExpr]], binding: PrimExpr, dtype: str = "int32"
+        dom: Union[ir.Range, List[PrimExpr], Tuple[PrimExpr]],
+        binding: PrimExpr,
+        dtype: str = "int32",
     ) -> Var:
         """The reduced block axis defining function.
 
@@ -584,7 +594,9 @@ class axis:  # pylint: disable=invalid-name
 
     @staticmethod
     def scan(
-        dom: Union[Range, List[PrimExpr], Tuple[PrimExpr]], binding: PrimExpr, dtype: str = "int32"
+        dom: Union[ir.Range, List[PrimExpr], Tuple[PrimExpr]],
+        binding: PrimExpr,
+        dtype: str = "int32",
     ) -> Var:
         """The scanning block axis defining function.
 
@@ -610,7 +622,9 @@ class axis:  # pylint: disable=invalid-name
 
     @staticmethod
     def opaque(
-        dom: Union[Range, List[PrimExpr], Tuple[PrimExpr]], binding: PrimExpr, dtype: str = "int32"
+        dom: Union[ir.Range, List[PrimExpr], Tuple[PrimExpr]],
+        binding: PrimExpr,
+        dtype: str = "int32",
     ) -> Var:
         """The opaque block axis defining function.
 
@@ -686,7 +700,10 @@ def serial(
     """
     if stop is None:
         stop = start
-        start = 0
+        if hasattr(start, "dtype"):
+            start = IntImm(start.dtype, 0)
+        else:
+            start = 0
     return _ffi_api.Serial(start, stop, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
@@ -713,7 +730,10 @@ def parallel(
     """
     if stop is None:
         stop = start
-        start = 0
+        if hasattr(start, "dtype"):
+            start = IntImm(start.dtype, 0)
+        else:
+            start = 0
     return _ffi_api.Parallel(start, stop, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
@@ -740,7 +760,10 @@ def vectorized(
     """
     if stop is None:
         stop = start
-        start = 0
+        if hasattr(start, "dtype"):
+            start = IntImm(start.dtype, 0)
+        else:
+            start = 0
     return _ffi_api.Vectorized(start, stop, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
@@ -767,7 +790,10 @@ def unroll(
     """
     if stop is None:
         stop = start
-        start = 0
+        if hasattr(start, "dtype"):
+            start = IntImm(start.dtype, 0)
+        else:
+            start = 0
     return _ffi_api.Unroll(start, stop, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
@@ -804,10 +830,16 @@ def thread_binding(
             raise ValueError("Thread cannot be None for thread_binding")
         thread = stop
         stop = start
-        start = 0
+        if hasattr(start, "dtype"):
+            start = IntImm(start.dtype, 0)
+        else:
+            start = 0
     elif stop is None:
         stop = start
-        start = 0
+        if hasattr(start, "dtype"):
+            start = IntImm(start.dtype, 0)
+        else:
+            start = 0
     return _ffi_api.ThreadBinding(  # type: ignore[attr-defined] # pylint: disable=no-member
         start, stop, thread, annotations
     )
@@ -845,7 +877,50 @@ def Assert(condition: PrimExpr, message: str) -> frame.AssertFrame:  # pylint: d
     res : frame.AssertFrame
         The result AssertFrame.
     """
+    if isinstance(condition, bool):
+        condition = IntImm("bool", condition)
     return _ffi_api.Assert(condition, message)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
+def LetStmt(  # pylint: disable=invalid-name
+    value: PrimExpr,
+    type_annotation: Optional[Type] = None,  # pylint: disable=redefined-outer-name
+    *,
+    var: Optional[Var] = None,  # pylint: disable=redefined-outer-name
+) -> frame.LetFrame:
+    """Create a LetStmt binding
+
+    Parameters
+    ----------
+    value : PrimExpr
+        The value to be bound.
+    type_annotation : Optional[Type] = None
+        The type annotation of the let binding. Usually it is used for fine-grained var typing,
+        particularly, PointerType.
+    var : Optional[Var] = None
+        The variable to bind. If not specified, a new variable will be created.
+
+    Returns
+    -------
+    let_frame : frame.LetFrame
+        The result LetFrame.
+    """
+    if type_annotation is not None:
+        if callable(type_annotation):
+            type_annotation = type_annotation()
+        if isinstance(type_annotation, Var):
+            type_annotation = type_annotation.type_annotation
+    return _ffi_api.LetStmt(value, type_annotation, var)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
+def Let(  # pylint: disable=invalid-name
+    expr: PrimExpr,
+    where: Dict[Var, PrimExpr],  # pylint: disable=redefined-outer-name
+) -> PrimExpr:
+    """Create a Let expression binding"""
+    assert len(where) == 1, "T.Let only allows `where` to have exactly one element"
+    var, value = list(where.items())[0]  # pylint: disable=redefined-outer-name
+    return tir.Let(var, value, expr)
 
 
 def let(
@@ -871,9 +946,19 @@ def let(
     res : frame.LetFrame
         The result LetFrame.
     """
+
+    @deprecated("T.let", "T.Let")
+    def let_expr(v: Var, value: PrimExpr, body: PrimExpr) -> PrimExpr:
+        return tir.Let(v, value, body)
+
+    @deprecated("T.let", "T.LetStmt")
+    def let_stmt(v: Var, value: PrimExpr) -> frame.LetFrame:
+        return _ffi_api.LegacyLetStmt(v, value)  # type: ignore[attr-defined] # pylint: disable=no-member
+
     if body is None:
-        return _ffi_api.Let(v, value)  # type: ignore[attr-defined] # pylint: disable=no-member
-    return Let(v, value, body)
+        return let_stmt(v, value)
+    else:
+        return let_expr(v, value, body)
 
 
 def realize(
@@ -907,7 +992,7 @@ def realize(
 def allocate(
     extents: List[PrimExpr],
     dtype: str,
-    scope: str = "",
+    scope: str = "global",
     condition: PrimExpr = None,
     annotations=None,
 ) -> frame.AllocateFrame:
@@ -959,9 +1044,18 @@ def allocate_const(
     annotations : Optional[Map]
         Additional annotations about the allocation.
     """
+    np_data = np.asarray(data, dtype=dtype)
+    prod_extent = 1
+    for extent in extents:
+        prod_extent *= extent
+    prod_shape = 1
+    for shape in np_data.shape:
+        prod_shape *= shape
+    if prod_extent == prod_shape:
+        np_data = np_data.reshape(extents)
 
     return _ffi_api.AllocateConst(  # type: ignore[attr-defined] # pylint: disable=no-member
-        ndarray.array(np.asarray(data, dtype)), dtype, extents, annotations
+        ndarray.array(np_data), dtype, extents, annotations
     )
 
 
@@ -1054,7 +1148,7 @@ def decl_buffer(
     data=None,
     strides=None,
     elem_offset=None,
-    scope="",
+    scope="global",
     align=0,
     offset_factor=0,
     buffer_type="",
@@ -1100,6 +1194,10 @@ def decl_buffer(
         The result DeclBufferFrame.
     """
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
+    if strides is not None:
+        strides = [Var(s, "int32") if isinstance(s, str) else s for s in strides]
+    else:
+        strides = []
     return _ffi_api.DeclBuffer(  # type: ignore[attr-defined] # pylint: disable=no-member
         shape,
         dtype,
@@ -1116,14 +1214,14 @@ def decl_buffer(
 
 
 def launch_thread(
-    iter_var: IterVar,  # pylint: disable=redefined-outer-name
+    thread: Union[IterVar, str],  # pylint: disable=redefined-outer-name
     extent: PrimExpr,
 ) -> frame.LaunchThreadFrame:
     """Launch a thread.
 
     Parameters
     ----------
-    iter_var : IterVar
+    thread : Union[IterVar, str]
         The iteration variable.
 
     extent : PrimExpr
@@ -1144,16 +1242,22 @@ def launch_thread(
     T.launch_thread(brow, 1)
 
     """
-    return _ffi_api.LaunchThread(iter_var, extent)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+    if isinstance(thread, str):
+        thread = String(thread)
+    return _ffi_api.LaunchThread(thread, extent)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def env_thread(thread_tag: str) -> IterVar:
-    """Bind a var to thread env"
+def env_thread(thread_tag: str, dtype: str = "int32") -> IterVar:
+    """Bind a var to thread env
 
     Parameters
     ----------
     thread_tag : str
         The thread type tag.
+
+    dtype : str
+        The data type of the thread env.
 
     Returns
     -------
@@ -1161,10 +1265,15 @@ def env_thread(thread_tag: str) -> IterVar:
         The result iteration variable gets bound to the thread env.
 
     """
-    return _ffi_api.EnvThread(thread_tag)  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.EnvThread(thread_tag, dtype)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def buffer_store(buffer: Buffer, value: PrimExpr, indices: List[Union[PrimExpr, slice]]) -> None:
+def buffer_store(
+    buffer: Buffer,  # pylint: disable=redefined-outer-name
+    value: PrimExpr,
+    indices: List[Union[PrimExpr, slice]],
+    predicate: Optional[PrimExpr] = None,
+) -> None:
     """Buffer store node.
 
     Parameters
@@ -1177,8 +1286,16 @@ def buffer_store(buffer: Buffer, value: PrimExpr, indices: List[Union[PrimExpr, 
 
     indices : List[Union[PrimExpr, slice]]
         The indices location to be stored.
+
+    predicate : Optional[PrimExpr]
+        A vector mask of boolean values indicating which lanes of a vector are to be
+        stored. The number lanes of the mask must be equal to the number of lanes in
+        value.
     """
     from tvm.arith import Analyzer  # pylint: disable=import-outside-toplevel
+
+    if not isinstance(indices, (list, tuple, ir.Array)):
+        indices = [indices]
 
     expr_indices = []
     for index in indices:
@@ -1188,27 +1305,30 @@ def buffer_store(buffer: Buffer, value: PrimExpr, indices: List[Union[PrimExpr, 
             if lanes == 1:
                 expr_indices.append(index.start)
             else:
-                expr_indices.append(ramp(index.start, step, int(lanes)))
+                expr_indices.append(ramp(index.start, step, lanes))
         else:
             expr_indices.append(index)
     if isinstance(value, bool) and buffer.dtype == "bool":
         value = IntImm("bool", value)
     return _ffi_api.BufferStore(  # type: ignore[attr-defined] # pylint: disable=no-member
-        buffer, value, expr_indices
+        buffer, value, expr_indices, predicate
     )
 
 
-def prefetch(buffer: Buffer, indices: List[PrimExpr]) -> None:
+def prefetch(
+    buffer: Buffer,  # pylint: disable=redefined-outer-name
+    bounds: List[ir.Range],
+) -> None:
     """The prefetch hint for a buffer.
 
     Parameters
     ----------
     buffer : Buffer
         The buffer to be prefetched.
-    indices : List[PrimExpr]
-        The indices of the buffer to extract.
+    bounds : List[Range]
+        The range to be prefetched.
     """
-    return _ffi_api.Prefetch(buffer, indices)  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.Prefetch(buffer, bounds)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def evaluate(value: PrimExpr) -> None:
@@ -1221,250 +1341,126 @@ def evaluate(value: PrimExpr) -> None:
     """
     if isinstance(value, str):
         value = StringImm(value)
+    if isinstance(value, bool):
+        value = cast(value, "bool")
     return _ffi_api.Evaluate(value)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def int8(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int8 or cast expression to type int8.
+def func_gen(name: str):
+    """Generate a function for each PrimExpr dtype.
 
     Parameters
     ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int8 or casted expression with type int8.
+    name: str
+        The ffi function name to call.
     """
-    return _ffi_api.Int8(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+    def func(
+        expr: Union[
+            None,
+            PrimExpr,
+            Literal["inf", "-inf", "nan"],
+            int,
+            float,
+        ] = None,
+        *,
+        is_size_var: bool = False,
+    ) -> PrimExpr:
+        if isinstance(expr, str):
+            expr = float(expr)
+        return getattr(_ffi_api, name)(expr, is_size_var)
+
+    return func
 
 
-def int16(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int16 or cast expression to type int16.
+# pylint: disable=invalid-name
+int8 = func_gen(("Int8"))
+int16 = func_gen(("Int16"))
+int32 = func_gen(("Int32"))
+int64 = func_gen(("Int64"))
+int8x4 = func_gen(("Int8x4"))
+int16x4 = func_gen(("Int16x4"))
+int32x4 = func_gen(("Int32x4"))
+int64x4 = func_gen(("Int64x4"))
+int8x8 = func_gen(("Int8x8"))
+int16x8 = func_gen(("Int16x8"))
+int32x8 = func_gen(("Int32x8"))
+int64x8 = func_gen(("Int64x8"))
+int8x16 = func_gen(("Int8x16"))
+int16x16 = func_gen(("Int16x16"))
+int32x16 = func_gen(("Int32x16"))
+int64x16 = func_gen(("Int64x16"))
+int8x32 = func_gen(("Int8x32"))
+int16x32 = func_gen(("Int16x32"))
+int32x32 = func_gen(("Int32x32"))
+int64x32 = func_gen(("Int64x32"))
+int8x64 = func_gen(("Int8x64"))
+int16x64 = func_gen(("Int16x64"))
+int32x64 = func_gen(("Int32x64"))
+int64x64 = func_gen(("Int64x64"))
 
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
+uint8 = func_gen(("UInt8"))
+uint16 = func_gen(("UInt16"))
+uint32 = func_gen(("UInt32"))
+uint64 = func_gen(("UInt64"))
+uint8x4 = func_gen(("UInt8x4"))
+uint16x4 = func_gen(("UInt16x4"))
+uint32x4 = func_gen(("UInt32x4"))
+uint64x4 = func_gen(("UInt64x4"))
+uint8x8 = func_gen(("UInt8x8"))
+uint16x8 = func_gen(("UInt16x8"))
+uint32x8 = func_gen(("UInt32x8"))
+uint64x8 = func_gen(("UInt64x8"))
+uint8x16 = func_gen(("UInt8x16"))
+uint16x16 = func_gen(("UInt16x16"))
+uint32x16 = func_gen(("UInt32x16"))
+uint64x16 = func_gen(("UInt64x16"))
+uint8x32 = func_gen(("UInt8x32"))
+uint16x32 = func_gen(("UInt16x32"))
+uint32x32 = func_gen(("UInt32x32"))
+uint64x32 = func_gen(("UInt64x32"))
+uint8x64 = func_gen(("UInt8x64"))
+uint16x64 = func_gen(("UInt16x64"))
+uint32x64 = func_gen(("UInt32x64"))
+uint64x64 = func_gen(("UInt64x64"))
 
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int16 or casted expression with type int16.
-    """
-    return _ffi_api.Int16(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
+float16 = func_gen(("Float16"))
+float32 = func_gen(("Float32"))
+float64 = func_gen(("Float64"))
+float16x4 = func_gen(("Float16x4"))
+float32x4 = func_gen(("Float32x4"))
+float64x4 = func_gen(("Float64x4"))
+float16x8 = func_gen(("Float16x8"))
+float32x8 = func_gen(("Float32x8"))
+float64x8 = func_gen(("Float64x8"))
+float16x16 = func_gen(("Float16x16"))
+float32x16 = func_gen(("Float32x16"))
+float64x16 = func_gen(("Float64x16"))
+float16x32 = func_gen(("Float16x32"))
+float32x32 = func_gen(("Float32x32"))
+float64x32 = func_gen(("Float64x32"))
+float16x64 = func_gen(("Float16x64"))
+float32x64 = func_gen(("Float32x64"))
+float64x64 = func_gen(("Float64x64"))
 
+e4m3_float8 = func_gen(("E4M3Float8"))
+e4m3_float8x4 = func_gen(("E4M3Float8x4"))
+e4m3_float8x8 = func_gen(("E4M3Float8x8"))
+e4m3_float8x16 = func_gen(("E4M3Float8x16"))
+e4m3_float8x32 = func_gen(("E4M3Float8x32"))
+e4m3_float8x64 = func_gen(("E4M3Float8x64"))
 
-def int32(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int32 or cast expression to type int32.
+e5m2_float8 = func_gen(("E5M2Float8"))
+e5m2_float8x4 = func_gen(("E5M2Float8x4"))
+e5m2_float8x8 = func_gen(("E5M2Float8x8"))
+e5m2_float8x16 = func_gen(("E5M2Float8x16"))
+e5m2_float8x32 = func_gen(("E5M2Float8x32"))
+e5m2_float8x64 = func_gen(("E5M2Float8x64"))
 
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int32 or casted expression with type int32.
-    """
-    return _ffi_api.Int32(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def int64(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int64 or cast expression to type int64.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int64 or casted expression with type int64.
-    """
-    return _ffi_api.Int64(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def uint8(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type uint8 or cast expression to type uint8.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type uint8 or casted expression with type uint8.
-    """
-    return _ffi_api.UInt8(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def uint16(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type uint16 or cast expression to type uint16.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type uint16 or casted expression with type uint16.
-    """
-    return _ffi_api.UInt16(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def uint32(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type uint32 or cast expression to type uint32.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type uint32 or casted expression with type uint32.
-    """
-    return _ffi_api.UInt32(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
+# pylint: enable=invalid-name
 
 
-def uint64(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type uint64 or cast expression to type uint64.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type uint64 or casted expression with type uint64.
-    """
-    return _ffi_api.UInt64(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def float8(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type float8 or cast expression to type float8.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type float8 or casted expression with type float8.
-    """
-    return _ffi_api.Float8(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def float16(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type float16 or cast expression to type float16.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type float16 or casted expression with type float16.
-    """
-    return _ffi_api.Float16(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def float32(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type float32 or cast expression to type float32.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type float32 or casted expression with type float32.
-    """
-    return _ffi_api.Float32(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def float64(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type float64 or cast expression to type float64.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type float64 or casted expression with type float64.
-    """
-    return _ffi_api.Float64(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def int32x4(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int32x4 or cast expression to type int32x4.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int32x4 or casted expression with type int32x4.
-    """
-    return _ffi_api.Int32x4(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def int32x8(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int32x8 or cast expression to type int32x8.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int32x8 or casted expression with type int32x8.
-    """
-    return _ffi_api.Int32x8(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def int32x16(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type int32x16 or cast expression to type int32x16.
-
-    Parameters
-    ----------
-    expr: PrimExpr
-        The expression to be cast.
-
-    Returns
-    -------
-    res : PrimExpr
-        The new tir.Var with type int32x16 or casted expression with type int32x16.
-    """
-    return _ffi_api.Int32x16(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
-
-
-def boolean(expr: Optional[PrimExpr] = None) -> PrimExpr:
+def boolean(expr: Optional[PrimExpr] = None, is_size_var: bool = False) -> PrimExpr:
     """Construct a new tir.Var with type boolean or cast expression to type boolean.
 
     Parameters
@@ -1472,31 +1468,50 @@ def boolean(expr: Optional[PrimExpr] = None) -> PrimExpr:
     expr: PrimExpr
         The expression to be cast.
 
+    is_size_var: bool
+        Whether or not to return a SizeVar instead of Var.
+
     Returns
     -------
     res : PrimExpr
         The new tir.Var with type boolean or casted expression with type boolean.
     """
-    return _ffi_api.Boolean(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.Boolean(expr, is_size_var)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def handle(expr: Optional[PrimExpr] = None) -> PrimExpr:
-    """Construct a new tir.Var with type handle or cast expression to type handle.
+def handle(
+    dtype: Optional[str] = None, storage_scope: str = "global", *, is_size_var: bool = False
+) -> Var:
+    """Create a TIR var that represents a pointer.
 
     Parameters
     ----------
-    expr: PrimExpr
-        The expression to be cast.
+    dtype: str
+        The data type of the pointer.
+
+    storage_scope: str
+        The storage scope of the pointer.
+
+    is_size_var: bool
+        Whether or not to return a SizeVar instead of Var.
 
     Returns
     -------
     res : PrimExpr
         The new tir.Var with type handle or casted expression with type handle.
     """
-    return _ffi_api.Handle(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
+    is_unknown_type = dtype is None
+    if dtype is None:
+        dtype = "void"
+    return _ffi_api.Handle(  # type: ignore[attr-defined] # pylint: disable=no-member
+        dtype,
+        storage_scope,
+        is_size_var,
+        is_unknown_type,
+    )
 
 
-def void(expr: Optional[PrimExpr] = None) -> PrimExpr:
+def void(expr: Optional[PrimExpr] = None, *, is_size_var: bool = False) -> PrimExpr:
     """Construct a new tir.Var with type void or cast expression to type void.
 
     Parameters
@@ -1509,9 +1524,10 @@ def void(expr: Optional[PrimExpr] = None) -> PrimExpr:
     res : PrimExpr
         The new tir.Var with type void or casted expression with type void.
     """
-    return _ffi_api.Void(expr)  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.Void(expr, is_size_var)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
+@deprecated("T.var", "T.{dtype}")
 def var(dtype: str, name: str = "") -> Var:
     """Construct a new tir.Var.
 
@@ -1531,7 +1547,30 @@ def var(dtype: str, name: str = "") -> Var:
     return Var(name, dtype)  # pylint: disable=no-member
 
 
-def ptr(dtype: str, storage_scope: str = "global") -> Var:
+def ptr(dtype: str, storage_scope: str = "global", is_size_var: bool = False) -> Var:
+    """The pointer declaration function.
+
+    Parameters
+    ----------
+    dtype : str
+        The data type of the pointer.
+
+    storage_scope : str
+        The storage scope of the pointer.
+
+    is_size_var: bool
+        Whether or not to return a SizeVar instead of Var.
+
+    Returns
+    -------
+    res : Var
+        The pointer.
+    """
+    return _ffi_api.Ptr(dtype, storage_scope, is_size_var)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
+@deprecated("T.buffer_var", "T.handle")
+def buffer_var(dtype: str, storage_scope: str = "global") -> Var:
     """The pointer declaration function.
 
     Parameters
@@ -1588,7 +1627,7 @@ def max(a: PrimExpr, b: PrimExpr) -> PrimExpr:  # pylint: disable=redefined-buil
     return _ffi_api.max(a, b)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def iter_var(v: Union[Var, str], dom: Range, iter_type: str, thread_tag: str) -> IterVar:
+def iter_var(v: Union[Var, str], dom: ir.Range, iter_type: str, thread_tag: str) -> IterVar:
     """The iteration variable.
 
     Parameters
@@ -1645,31 +1684,122 @@ def comm_reducer(combiner: Callable, identity: List[PrimExpr]) -> CommReducer:
     return CommReducer(args[: num_args // 2], args[num_args // 2 :], res, identity)
 
 
-def _op_wrapper(func):
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        if "dtype" in kwargs:
-            kwargs.pop("dtype")
-        return func(*args, **kwargs)
+def index_map(
+    mapping: Callable,
+    *,
+    inverse_index_map: Optional[Callable] = None,
+    index_dtype: str = "int64",
+) -> IndexMap:
+    """Create a TIR Index mapping"""
+    return IndexMap.from_func(mapping, inverse_index_map=inverse_index_map, index_dtype=index_dtype)
 
-    return wrapped
+
+def target(
+    target_config: Union[Dict, str],
+    host: Optional[Union[Dict, str, Target]] = None,
+) -> Target:
+    """
+    Create a target
+
+    Parameters
+    ----------
+    target_config : Union[Dict, str]
+        The target configuration.
+
+    host : Optional[Union[Dict, str, Target]]
+        The target configuration.
+
+    Returns
+    -------
+    res : Target
+        The target.
+    """
+    if not isinstance(target_config, (str, dict)):
+        raise ValueError(
+            f"T.target expected a config dict or string, but got {type(target_config)}"
+        )
+    if host is not None and not isinstance(host, (str, dict, Target)):
+        raise ValueError(
+            "T.target expected the host to be "
+            "a config dict, string, or T.target, "
+            f"but got {type(host)}"
+        )
+    if isinstance(target_config, dict) and "host" in target_config and host is not None:
+        raise ValueError(
+            "T.target expects to either receive the host "
+            "as part of the target's config dictionary, "
+            "or as a separate argument, but not both."
+        )
+    return Target(target_config, host)
 
 
-def _dtype_forward(func):
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        if "dtype" in kwargs:
-            args = (kwargs.pop("dtype"),) + args
-        return func(*args, **kwargs)
+def Range(begin: PrimExpr, end: PrimExpr) -> ir.Range:  # pylint: disable=invalid-name
+    """
+    Create a Range object.
 
-    return wrapped
+    Parameters
+    ----------
+    begin : PrimExpr
+        The begin value of the range.
+
+    end : Optional[PrimExpr]
+        The end value of the range.
+    """
+    return ir.Range(begin, end)
+
+
+class meta_var:  # pylint: disable=invalid-name
+    """A meta variable used in TVMScript metaprogramming. It means that the value of the variable
+    does not appear in the final TIR, but only stays in the parser.
+
+    Parameters
+    ----------
+    value: Any
+        The meta variable.
+    """
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __iter__(self):
+        def f():
+            for i in self.value:
+                yield meta_var(i)
+
+        return f()
 
 
 # pylint: disable=invalid-name
 
-buffer_var = ptr
+
+if sys.version_info >= (3, 10):
+    from typing import ParamSpec, TypeVar  # pylint: disable=import-error
+
+    T = TypeVar("T")
+    P = ParamSpec("P")
+
+    def _op_wrapper(func: Callable[P, T]) -> Callable[P, T]:
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs) -> T:
+            if "dtype" in kwargs:
+                kwargs.pop("dtype")
+            return func(*args, **kwargs)
+
+        return wrapped
+
+else:
+
+    def _op_wrapper(func):
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            if "dtype" in kwargs:
+                kwargs.pop("dtype")
+            return func(*args, **kwargs)
+
+        return wrapped
+
+
 abs = _op_wrapper(_tir_op.abs)  # pylint: disable=redefined-builtin
-fabs = abs
 acos = _op_wrapper(_tir_op.acos)
 acosh = _op_wrapper(_tir_op.acosh)
 address_of = _op_wrapper(_tir_op.address_of)
@@ -1678,6 +1808,10 @@ asinh = _op_wrapper(_tir_op.asinh)
 atan = _op_wrapper(_tir_op.atan)
 atan2 = _op_wrapper(_tir_op.atan2)
 atanh = _op_wrapper(_tir_op.atanh)
+bitwise_and = _op_wrapper(_tir_op.bitwise_and)
+bitwise_not = _op_wrapper(_tir_op.bitwise_not)
+bitwise_or = _op_wrapper(_tir_op.bitwise_or)
+bitwise_xor = _op_wrapper(_tir_op.bitwise_xor)
 ceil = _op_wrapper(_tir_op.ceil)
 clz = _op_wrapper(_tir_op.clz)
 copysign = _op_wrapper(_tir_op.copysign)
@@ -1711,10 +1845,10 @@ min_value = _op_wrapper(_tir_op.min_value)
 nearbyint = _op_wrapper(_tir_op.nearbyint)
 nextafter = _op_wrapper(_tir_op.nextafter)
 popcount = _op_wrapper(_tir_op.popcount)
-power = _op_wrapper(_tir_op.power)
+pow = _op_wrapper(_tir_op.pow)  # pylint: disable=redefined-builtin
 q_multiply_shift = _op_wrapper(_tir_op.q_multiply_shift)
+q_multiply_shift_per_axis = _op_wrapper(_tir_op.q_multiply_shift_per_axis)
 ret = _op_wrapper(_tir_op.ret)
-reinterpret = _dtype_forward(_tir_op.reinterpret)
 round = _op_wrapper(_tir_op.round)  # pylint: disable=redefined-builtin
 rsqrt = _op_wrapper(_tir_op.rsqrt)
 shift_left = _op_wrapper(_tir_op.shift_left)
@@ -1733,70 +1867,173 @@ tvm_throw_last_error = _op_wrapper(_tir_op.tvm_throw_last_error)
 tvm_stack_alloca = _op_wrapper(_tir_op.tvm_stack_alloca)
 tvm_stack_make_shape = _op_wrapper(_tir_op.tvm_stack_make_shape)
 tvm_stack_make_array = _op_wrapper(_tir_op.tvm_stack_make_array)
+tvm_check_return = _op_wrapper(_tir_op.tvm_check_return)
 call_packed = _op_wrapper(_tir_op.call_packed)
 call_cpacked = _op_wrapper(_tir_op.call_cpacked)
 call_packed_lowered = _op_wrapper(_tir_op.call_packed_lowered)
 call_cpacked_lowered = _op_wrapper(_tir_op.call_cpacked_lowered)
-call_extern = _dtype_forward(_tir_op.call_extern)
-call_intrin = _dtype_forward(_tir_op.call_intrin)
-call_llvm_intrin = _dtype_forward(_tir_op.call_llvm_intrin)
-call_llvm_pure_intrin = _dtype_forward(_tir_op.call_llvm_pure_intrin)
-call_pure_extern = _dtype_forward(_tir_op.call_pure_extern)
-tvm_access_ptr = _op_wrapper(_tir_op.tvm_access_ptr)
 tvm_tuple = _op_wrapper(_tir_op.tvm_tuple)
 tvm_struct_set = _op_wrapper(_tir_op.tvm_struct_set)
 tvm_struct_get = _tir_op.tvm_struct_get
+tvm_thread_invariant = _op_wrapper(_tir_op.tvm_thread_invariant)
 tvm_thread_allreduce = _op_wrapper(_tir_op.tvm_thread_allreduce)
 tvm_load_matrix_sync = _op_wrapper(_tir_op.tvm_load_matrix_sync)
 tvm_mma_sync = _op_wrapper(_tir_op.tvm_mma_sync)
 tvm_bmma_sync = _op_wrapper(_tir_op.tvm_bmma_sync)
 tvm_fill_fragment = _op_wrapper(_tir_op.tvm_fill_fragment)
 tvm_store_matrix_sync = _op_wrapper(_tir_op.tvm_store_matrix_sync)
+tvm_storage_sync = _tir_op.tvm_storage_sync
+tvm_warp_shuffle = _tir_op.tvm_warp_shuffle
+tvm_warp_shuffle_up = _tir_op.tvm_warp_shuffle_up
+tvm_warp_shuffle_down = _tir_op.tvm_warp_shuffle_down
+tvm_warp_activemask = _tir_op.tvm_warp_activemask
+ptx_wait_group = _op_wrapper(_tir_op.ptx_wait_group)
+ptx_commit_group = _op_wrapper(_tir_op.ptx_commit_group)
+ptx_cp_async_barrier = _op_wrapper(_tir_op.ptx_cp_async_barrier)
+ptx_init_barrier_thread_count = _op_wrapper(_tir_op.ptx_init_barrier_thread_count)
+ptx_arrive_barrier = _op_wrapper(_tir_op.ptx_arrive_barrier)
+ptx_arrive_barrier_expect_tx = _op_wrapper(_tir_op.ptx_arrive_barrier_expect_tx)
+ptx_wait_barrier = _op_wrapper(_tir_op.ptx_wait_barrier)
+make_filled_simdgroup_matrix = _op_wrapper(_tir_op.make_filled_simdgroup_matrix)
+simdgroup_load = _op_wrapper(_tir_op.simdgroup_load)
+simdgroup_store = _op_wrapper(_tir_op.simdgroup_store)
+simdgroup_multiply_accumulate = _op_wrapper(_tir_op.simdgroup_multiply_accumulate)
+create_barriers = _op_wrapper(_tir_op.create_barriers)
+assume = _op_wrapper(_tir_op.assume)
+undef = _op_wrapper(_tir_op.undef)
+TVMBackendAllocWorkspace = _op_wrapper(_tir_op.TVMBackendAllocWorkspace)
+TVMBackendFreeWorkspace = _op_wrapper(_tir_op.TVMBackendFreeWorkspace)
+start_profile_intrinsic = _op_wrapper(_tir_op.start_profile_intrinsic)
+end_profile_intrinsic = _op_wrapper(_tir_op.end_profile_intrinsic)
+anylist_getitem = _op_wrapper(_tir_op.anylist_getitem)
+anylist_resetitem = _op_wrapper(_tir_op.anylist_resetitem)
+anylist_setitem_call_packed = _op_wrapper(_tir_op.anylist_setitem_call_packed)
+anylist_setitem_call_cpacked = _op_wrapper(_tir_op.anylist_setitem_call_cpacked)
+vscale = _op_wrapper(_tir_op.vscale)
+ignore_loop_partition = _op_wrapper(_tir_op.ignore_loop_partition)
+
+
+def _dtype_forward(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        if "dtype" in kwargs:
+            args = (kwargs.pop("dtype"),) + args
+        return func(*args, **kwargs)
+
+    return wrapped
+
+
+reinterpret = _dtype_forward(_tir_op.reinterpret)
+call_extern = _dtype_forward(_tir_op.call_extern)
+call_intrin = _dtype_forward(_tir_op.call_intrin)
+call_llvm_intrin = _dtype_forward(_tir_op.call_llvm_intrin)
+call_llvm_pure_intrin = _dtype_forward(_tir_op.call_llvm_pure_intrin)
+call_pure_extern = _dtype_forward(_tir_op.call_pure_extern)
 ptx_mma = _dtype_forward(_tir_op.ptx_mma)
 ptx_mma_sp = _dtype_forward(_tir_op.ptx_mma_sp)
 ptx_ldmatrix = _dtype_forward(_tir_op.ptx_ldmatrix)
 ptx_cp_async = _dtype_forward(_tir_op.ptx_cp_async)
-ptx_wait_group = _op_wrapper(_tir_op.ptx_wait_group)
-ptx_commit_group = _op_wrapper(_tir_op.ptx_commit_group)
+ptx_cp_async_bulk = _dtype_forward(_tir_op.ptx_cp_async_bulk)
 mma_store = _dtype_forward(_tir_op.mma_store)
 mma_fill = _dtype_forward(_tir_op.mma_fill)
 vectorlow = _dtype_forward(_tir_op.vectorlow)
 vectorhigh = _dtype_forward(_tir_op.vectorhigh)
 vectorcombine = _dtype_forward(_tir_op.vectorcombine)
-assume = _op_wrapper(_tir_op.assume)
-undef = _op_wrapper(_tir_op.undef)
+get_active_lane_mask = _dtype_forward(_tir_op.get_active_lane_mask)
+dp4a = _dtype_forward(_tir_op.dp4a)
+
+
+broadcast = Broadcast
+ramp = Ramp
+fabs = abs
 tvm_call_packed = call_packed
 tvm_call_cpacked = call_cpacked
 tvm_call_packed_lowered = call_packed_lowered
 tvm_call_cpacked_lowered = call_cpacked_lowered
-TVMBackendAllocWorkspace = _op_wrapper(_tir_op.TVMBackendAllocWorkspace)
-TVMBackendFreeWorkspace = _op_wrapper(_tir_op.TVMBackendFreeWorkspace)
-
-
-class inline:
-    """Inline function for meta-programming.
-
-    Parameters
-    ----------
-    value: Any
-        The value to be inlined.
-    """
-
-    def __init__(self, value: Any) -> None:
-        self.value = value
-
-    def __iter__(self):
-        def f():
-            for i in self.value:
-                yield inline(i)
-
-        return f()
-
 
 # pylint: enable=invalid-name
 
 
 __all__ = [
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "int8x4",
+    "int16x4",
+    "int32x4",
+    "int64x4",
+    "int8x8",
+    "int16x8",
+    "int32x8",
+    "int64x8",
+    "int8x16",
+    "int16x16",
+    "int32x16",
+    "int64x16",
+    "int8x32",
+    "int16x32",
+    "int32x32",
+    "int64x32",
+    "int8x64",
+    "int16x64",
+    "int32x64",
+    "int64x64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uint8x4",
+    "uint16x4",
+    "uint32x4",
+    "uint64x4",
+    "uint8x8",
+    "uint16x8",
+    "uint32x8",
+    "uint64x8",
+    "uint8x16",
+    "uint16x16",
+    "uint32x16",
+    "uint64x16",
+    "uint8x32",
+    "uint16x32",
+    "uint32x32",
+    "uint64x32",
+    "uint8x64",
+    "uint16x64",
+    "uint32x64",
+    "uint64x64",
+    "e4m3_float8",
+    "e5m2_float8",
+    "float16",
+    "float32",
+    "float64",
+    "e4m3_float8x4",
+    "e5m2_float8x4",
+    "float16x4",
+    "float32x4",
+    "float64x4",
+    "e4m3_float8x8",
+    "e5m2_float8x8",
+    "float16x8",
+    "float32x8",
+    "float64x8",
+    "e4m3_float8x16",
+    "e5m2_float8x16",
+    "float16x16",
+    "float32x16",
+    "float64x16",
+    "e4m3_float8x32",
+    "e5m2_float8x32",
+    "float16x32",
+    "float32x32",
+    "float64x32",
+    "e4m3_float8x64",
+    "e5m2_float8x64",
+    "float16x64",
+    "float32x64",
+    "float64x64",
+    "buffer",
     "buffer_decl",
     "prim_func",
     "arg",
@@ -1804,7 +2041,6 @@ __all__ = [
     "func_attr",
     "func_ret",
     "match_buffer",
-    "preflattened_buffer",
     "block",
     "init",
     "where",
@@ -1820,7 +2056,6 @@ __all__ = [
     "thread_binding",
     "grid",
     "Assert",
-    "let",
     "realize",
     "allocate",
     "allocate_const",
@@ -1835,21 +2070,6 @@ __all__ = [
     "buffer_store",
     "prefetch",
     "evaluate",
-    "int8",
-    "int16",
-    "int32",
-    "int64",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "float8",
-    "float16",
-    "float32",
-    "float64",
-    "int32x4",
-    "int32x8",
-    "int32x16",
     "boolean",
     "handle",
     "void",
@@ -1859,6 +2079,8 @@ __all__ = [
     "max",
     "iter_var",
     "comm_reducer",
+    "index_map",
+    "target",
     "buffer_var",
     "abs",
     "fabs",
@@ -1870,6 +2092,10 @@ __all__ = [
     "atan",
     "atan2",
     "atanh",
+    "bitwise_and",
+    "bitwise_not",
+    "bitwise_or",
+    "bitwise_xor",
     "ceil",
     "clz",
     "copysign",
@@ -1903,8 +2129,9 @@ __all__ = [
     "nearbyint",
     "nextafter",
     "popcount",
-    "power",
+    "pow",
     "q_multiply_shift",
+    "q_multiply_shift_per_axis",
     "ret",
     "reinterpret",
     "round",
@@ -1925,6 +2152,7 @@ __all__ = [
     "tvm_stack_alloca",
     "tvm_stack_make_shape",
     "tvm_stack_make_array",
+    "tvm_check_return",
     "call_packed",
     "call_cpacked",
     "call_packed_lowered",
@@ -1934,27 +2162,44 @@ __all__ = [
     "call_llvm_intrin",
     "call_llvm_pure_intrin",
     "call_pure_extern",
-    "tvm_access_ptr",
     "tvm_tuple",
     "tvm_struct_set",
     "tvm_struct_get",
+    "tvm_thread_invariant",
     "tvm_thread_allreduce",
     "tvm_load_matrix_sync",
     "tvm_mma_sync",
     "tvm_bmma_sync",
     "tvm_fill_fragment",
     "tvm_store_matrix_sync",
+    "tvm_storage_sync",
+    "tvm_warp_shuffle",
+    "tvm_warp_shuffle_up",
+    "tvm_warp_shuffle_down",
+    "tvm_warp_activemask",
     "ptx_mma",
     "ptx_mma_sp",
     "ptx_ldmatrix",
     "ptx_cp_async",
+    "ptx_cp_async_bulk",
     "ptx_wait_group",
     "ptx_commit_group",
+    "ptx_cp_async_barrier",
+    "ptx_init_barrier_thread_count",
+    "ptx_arrive_barrier",
+    "ptx_arrive_barrier_expect_tx",
+    "ptx_wait_barrier",
+    "make_filled_simdgroup_matrix",
+    "simdgroup_load",
+    "simdgroup_store",
+    "simdgroup_multiply_accumulate",
+    "create_barriers",
     "mma_store",
     "mma_fill",
     "vectorlow",
     "vectorhigh",
     "vectorcombine",
+    "dp4a",
     "assume",
     "undef",
     "tvm_call_packed",
@@ -1963,14 +2208,60 @@ __all__ = [
     "tvm_call_cpacked_lowered",
     "TVMBackendAllocWorkspace",
     "TVMBackendFreeWorkspace",
-    "inline",
+    "start_profile_intrinsic",
+    "end_profile_intrinsic",
+    "meta_var",
+    "anylist_getitem",
+    "anylist_resetitem",
+    "anylist_setitem_call_packed",
+    "anylist_setitem_call_cpacked",
     "llvm_lookup_intrinsic_id",
-    "Cast",
-    "Let",
-    "Select",
-    "Shuffle",
     "type_annotation",
     "broadcast",
     "ramp",
     "cast",
+    # tvm.tir.expr
+    "Var",
+    "SizeVar",
+    "Reduce",
+    "FloatImm",
+    "IntImm",
+    "StringImm",
+    "Cast",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Mod",
+    "FloorDiv",
+    "FloorMod",
+    "Min",
+    "Max",
+    "EQ",
+    "NE",
+    "LT",
+    "LE",
+    "GT",
+    "GE",
+    "And",
+    "Or",
+    "Not",
+    "Select",
+    "BufferLoad",
+    "ProducerLoad",
+    "Ramp",
+    "Broadcast",
+    "Shuffle",
+    "Call",
+    "CallEffectKind",
+    "let",
+    "LetStmt",
+    "Let",
+    "IterVar",
+    "CommReducer",
+    "Range",
+    "vscale",
+    "get_active_lane_mask",
+    "call_kernel",
+    "ignore_loop_partition",
 ]

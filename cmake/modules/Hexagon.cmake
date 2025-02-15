@@ -125,10 +125,20 @@ if(BUILD_FOR_HEXAGON)
   file_glob_append(RUNTIME_HEXAGON_SRCS
     "${TVMRT_SOURCE_DIR}/hexagon/*.cc"
   )
+  # Add builtins to RelaxVM
+  tvm_file_glob(GLOB RELAX_VM_BUILTIN_SRC_CC src/runtime/relax_vm/hexagon/*.cc)
+  list(APPEND RUNTIME_SRCS ${RELAX_VM_BUILTIN_SRC_CC})
 else()
   file_glob_append(RUNTIME_HEXAGON_SRCS
     "${TVMRT_SOURCE_DIR}/hexagon/hexagon_module.cc"
   )
+endif()
+
+set(htp_supported_archs "v68" "v69" "v73" "v75")
+list(FIND htp_supported_archs "${USE_HEXAGON_ARCH}" supported_arch_index)
+if(${supported_arch_index} EQUAL -1)
+  # Exclude User DMA files when building for archs below v68
+  list(REMOVE_ITEM RUNTIME_HEXAGON_SRCS "${TVMRT_SOURCE_DIR}/hexagon/hexagon_user_dma.cc")
 endif()
 
 if(BUILD_FOR_HEXAGON)
@@ -136,6 +146,10 @@ if(BUILD_FOR_HEXAGON)
     file_glob_append(RUNTIME_HEXAGON_SRCS
       "${CMAKE_SOURCE_DIR}/tests/cpp-runtime/hexagon/*.cc"
     )
+    if(${supported_arch_index} EQUAL -1)
+      # Exclude User DMA files when building for archs below v68
+      list(REMOVE_ITEM RUNTIME_HEXAGON_SRCS "${TVMRT_SOURCE_DIR}/hexagon/hexagon_user_dma_tests.cc")
+    endif()
   endif()
   get_hexagon_sdk_property("${USE_HEXAGON_SDK}" "${USE_HEXAGON_ARCH}"
     SDK_INCLUDE   SDK_INCLUDE_DIRS
@@ -173,15 +187,64 @@ if(BUILD_FOR_HEXAGON)
 
   endif()
 
-  # Hand-written ops
-  file_glob_append(RUNTIME_HEXAGON_SRCS
-    "${TVMRT_SOURCE_DIR}/hexagon/ops/*.cc"
-  )
+  # Exclude HVX implementation files when building for archs below v68
+  if(${supported_arch_index} GREATER -1)
+    # Hand-written ops
+    file_glob_append(RUNTIME_HEXAGON_SRCS
+      "${TVMRT_SOURCE_DIR}/hexagon/ops/*.cc"
+    )
 
-  set_source_files_properties(
-    "${TVMRT_SOURCE_DIR}/hexagon/ops/conv2d_fp16_hvx.cc"
-    PROPERTIES COMPILE_FLAGS "-mhvx"
-  )
+    include_directories(
+      "${TVMRT_SOURCE_DIR}/hexagon/ops"
+    )
+
+    set_source_files_properties(
+      "${TVMRT_SOURCE_DIR}/hexagon/ops/conv2d_quant_hvx.cc"
+      PROPERTIES COMPILE_FLAGS "-mhvx"
+    )
+
+    set_source_files_properties(
+      "${TVMRT_SOURCE_DIR}/hexagon/ops/conv2d_fp16_hvx.cc"
+      PROPERTIES COMPILE_FLAGS "-mhvx"
+    )
+  endif()
+
+  # Include hexagon external library runtime sources
+  if(USE_HEXAGON_EXTERNAL_LIBS)
+    # Check if the libs are provided as an absolute path
+    if (EXISTS ${USE_HEXAGON_EXTERNAL_LIBS})
+    # Check if the libs are provided as a git url
+    elseif(USE_HEXAGON_EXTERNAL_LIBS MATCHES "\.git$")
+      if (NOT DEFINED HEXAGON_EXTERNAL_LIBS_SHA)
+        message(FATAL_ERROR "HEXAGON_EXTERNA_LIBS_SHA must be set when "
+          "USE_HEXAGON_EXTERNAL_LIBS is set to a git repository")
+      endif()
+      include(FetchContent)
+      FetchContent_Declare(hexagon_external
+        GIT_REPOSITORY "${USE_HEXAGON_EXTERNAL_LIBS}"
+        GIT_TAG "${HEXAGON_EXTERNAL_LIBS_SHA}")
+      FetchContent_MakeAvailable(hexagon_external)
+      set(USE_HEXAGON_EXTERNAL_LIBS "${hexagon_external_SOURCE_DIR}")
+    else()
+      message(FATAL_ERROR "Invalid use of USE_HEXAGON_EXTERNAL_LIBS="
+        "${USE_HEXAGON_EXTERNAL_LIBS}; USE_HEXAGON_EXTERNAL_LIBS only "
+        "supports absolute paths and git repository urls")
+    endif()
+
+    file_glob_append(HEXAGON_EXTERNAL_RUNTIME_SRCS
+      "${USE_HEXAGON_EXTERNAL_LIBS}/src/runtime/hexagon/*.cc"
+    )
+    list(APPEND RUNTIME_HEXAGON_SRCS "${HEXAGON_EXTERNAL_RUNTIME_SRCS}")
+    if (EXISTS "${USE_HEXAGON_EXTERNAL_LIBS}/HexagonExternalCompileFlags.cmake")
+      # External libraries will define HEXAGON_EXTERNAL_LIBS_COMPILE_FLAGS,
+      # changing this variable name will break downstream external libraries.
+      include("${USE_HEXAGON_EXTERNAL_LIBS}/HexagonExternalCompileFlags.cmake")
+      set_source_files_properties(
+        "${HEXAGON_EXTERNAL_RUNTIME_SRCS}"
+        PROPERTIES COMPILE_FLAGS "${HEXAGON_EXTERNAL_LIBS_COMPILE_FLAGS}"
+        )
+    endif()
+  endif()
 endif()
 
 if(USE_HEXAGON_RPC)
@@ -244,10 +307,14 @@ if(USE_HEXAGON_RPC)
       # TODO(masahi): Remove rpc_local_session.cc after verifying that things work without it
       "${TVMRT_SOURCE_DIR}/rpc/rpc_local_session.cc"
     )
+    set(HEXAGON_PROFILER_DIR "${TVMRT_SOURCE_DIR}/hexagon/profiler")
     # Add the hardware-specific RPC code into the skel library.
+    set_property(SOURCE ${HEXAGON_PROFILER_DIR}/lwp_handler.S PROPERTY LANGUAGE C)
     add_library(hexagon_rpc_skel SHARED
       "${TVMRT_SOURCE_DIR}/hexagon/rpc/hexagon/rpc_server.cc"
       "${TVMRT_SOURCE_DIR}/hexagon/rpc/hexagon_rpc_skel.c"
+      "${HEXAGON_PROFILER_DIR}/prof_utils.cc"
+      "${HEXAGON_PROFILER_DIR}/lwp_handler.S"
     )
     target_include_directories(hexagon_rpc_skel
       SYSTEM PRIVATE "${TVMRT_SOURCE_DIR}/hexagon/rpc"
@@ -256,6 +323,8 @@ if(USE_HEXAGON_RPC)
     # executed via run_main_on_sim.
     add_library(hexagon_rpc_sim SHARED
       "${TVMRT_SOURCE_DIR}/hexagon/rpc/simulator/rpc_server.cc"
+      "${HEXAGON_PROFILER_DIR}/prof_utils.cc"
+      "${HEXAGON_PROFILER_DIR}/lwp_handler.S"
     )
     target_link_libraries(hexagon_rpc_sim
       -Wl,--whole-archive tvm_runtime -Wl,--no-whole-archive

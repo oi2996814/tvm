@@ -15,10 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 """Test packed function FFI."""
+import gc
+
+import numpy as np
+
 import tvm
 from tvm import te
 import tvm.testing
-import numpy as np
+from tvm.script import tir as T
 
 
 def test_get_global():
@@ -37,7 +41,7 @@ def test_get_global():
 
 
 def test_get_callback_with_node():
-    x = tvm.runtime.convert(10)
+    x = T.int32(10)
 
     def test(y):
         assert y.handle != x.handle
@@ -66,7 +70,7 @@ def test_return_func():
 
     myf = tvm.runtime.convert(addy)
     f = myf(10)
-    assert f(11).value == 21
+    assert f(11) == 21
 
 
 def test_convert():
@@ -113,6 +117,14 @@ def test_device():
 
 def test_rvalue_ref():
     def callback(x, expected_count):
+        # The use count of TVM objects is decremented as part of
+        # `ObjectRef.__del__`, which runs when the Python object is
+        # destructed.  However, Python object destruction is not
+        # deterministic, and even CPython's reference-counting is
+        # considered an implementation detail.  Therefore, to ensure
+        # correct results from this test, `gc.collect()` must be
+        # explicitly called.
+        gc.collect()
         assert expected_count == tvm.testing.object_use_count(x)
         return x
 
@@ -153,6 +165,18 @@ def test_ndarray_args():
     assert tvm.testing.object_use_count(x) == 1
 
 
+def test_dict_function_value_type():
+    from tvm import tir  # pylint: disable=import-outside-toplevel
+
+    te_func_dict = {"add": lambda a, b: a + b}
+
+    converted_dict = tvm.runtime.convert(te_func_dict)
+    f = converted_dict["add"]
+    a = tir.Var("a", "float32")
+    b = tir.Var("b", "float32")
+    tvm.ir.assert_structural_equal(f(a, b), tir.Add(a, b))
+
+
 if __name__ == "__main__":
     test_ndarray_args()
     test_numpy_scalar()
@@ -164,3 +188,4 @@ if __name__ == "__main__":
     test_return_func()
     test_byte_array()
     test_device()
+    test_dict_function_value_type()

@@ -14,25 +14,27 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=unrecognized-inline-option
 """Function data types."""
 
 import collections
 import inspect
-from typing import Callable, List, Mapping, Optional, Union, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple, Union
 
 import tvm
 import tvm._ffi
 import tvm.runtime
-from tvm.runtime import Object
 from tvm.ir import BaseFunc, Range
-from .buffer import Buffer
-from .expr import Var, PrimExpr
-from . import _ffi_api
+from tvm.runtime import Object, Scriptable
+
 from ..runtime.ndarray import NDArray
+from . import _ffi_api
+from .buffer import Buffer
+from .expr import PrimExpr, Var
 
 
 @tvm._ffi.register_object("tir.PrimFunc")
-class PrimFunc(BaseFunc):
+class PrimFunc(BaseFunc, Scriptable):
     """A function declaration expression.
 
     Parameters
@@ -49,9 +51,6 @@ class PrimFunc(BaseFunc):
     buffer_map : Map[tvm.tir.Var, tvm.tir.Buffer]
         The buffer binding map.
 
-    preflattened_buffer_map : Optional[Map[tvm.tir.Var, tvm.tir.Buffer]]
-        The buffer binding map, prior to any flattening.
-
     attrs: Optional[tvm.Attrs]
         Attributes of the function, can be None
 
@@ -65,14 +64,11 @@ class PrimFunc(BaseFunc):
         body,
         ret_type=None,
         buffer_map=None,
-        preflattened_buffer_map=None,
         attrs=None,
         span=None,
     ):
-
         param_list = []
         buffer_map = {} if buffer_map is None else buffer_map
-        preflattened_buffer_map = {} if preflattened_buffer_map is None else preflattened_buffer_map
         for x in params:
             x = tvm.runtime.convert(x) if not isinstance(x, Object) else x
             if isinstance(x, Buffer):
@@ -84,13 +80,15 @@ class PrimFunc(BaseFunc):
             else:
                 raise TypeError("params can only contain Var or Buffer")
 
+        if attrs is None:
+            attrs = tvm.ir.make_node("DictAttrs")
+
         self.__init_handle_by_constructor__(
             _ffi_api.PrimFunc,
             param_list,
             body,
             ret_type,
             buffer_map,
-            preflattened_buffer_map,
             attrs,
             span,
         )  # type: ignore
@@ -116,7 +114,6 @@ class PrimFunc(BaseFunc):
             new_body,
             self.ret_type,
             self.buffer_map,
-            self.preflattened_buffer_map,
             self.attrs,
             span,
         )
@@ -175,39 +172,6 @@ class PrimFunc(BaseFunc):
             The new function with parameter specialized
         """
         return _ffi_api.Specialize(self, param_map)  # type: ignore
-
-    def script(self, tir_prefix: str = "T", show_meta: bool = False) -> str:
-        """Print IRModule into TVMScript
-
-        Parameters
-        ----------
-        tir_prefix : str
-            The tir namespace prefix
-
-        show_meta : bool
-            Whether to show meta information
-
-        Returns
-        -------
-        script : str
-            The TVM Script of the PrimFunc
-        """
-        return tvm._ffi.get_global_func("script.AsTVMScript")(
-            self, tir_prefix, show_meta
-        )  # type: ignore
-
-    def show(self, style: Optional[str] = None) -> None:
-        """
-        A sugar for print highlighted TVM script.
-        Parameters
-        ----------
-        style : str, optional
-            Pygments styles extended by "light" (default) and "dark", by default "light"
-        """
-        from tvm.script.highlight import cprint  # pylint: disable=import-outside-toplevel
-
-        # Use deferred import to avoid circular import while keeping cprint under tvm/script
-        cprint(self, style=style)
 
 
 @tvm._ffi.register_object("tir.TensorIntrin")
@@ -304,6 +268,8 @@ class IndexMap(Object):
         mapping_function: Callable,
         ndim: Optional[int] = None,
         inverse_index_map: Union[Callable, Optional["IndexMap"]] = None,
+        *,
+        index_dtype: str = "int64",
     ):
         """Create an index map from a function
 
@@ -340,7 +306,10 @@ class IndexMap(Object):
 
         """
         index_map, axis_separators = IndexMap.from_func_with_separators(
-            mapping_function, ndim, inverse_index_map
+            mapping_function,
+            ndim,
+            inverse_index_map,
+            index_dtype=index_dtype,
         )
         assert not axis_separators, (
             "The mapping_function provided to IndexMap.from_func "
@@ -354,6 +323,8 @@ class IndexMap(Object):
         mapping_function: Callable,
         ndim: Optional[int] = None,
         inverse_index_map: Union[Callable, Optional["IndexMap"]] = None,
+        *,
+        index_dtype: str = "int64",
     ):
         """Create an index map from a function
 
@@ -384,6 +355,9 @@ class IndexMap(Object):
             It is the user's responsibility to ensure the correctness of the pre-defined inverse
             index map.
 
+        index_dtype : str
+            The default index dtype to use for input iters in the mapping function.
+
         Returns
         -------
         ret: Tuple[IndexMap, List[int]]
@@ -399,20 +373,19 @@ class IndexMap(Object):
         args = []
         var_arg_name = None
         kwargs = collections.OrderedDict()
-        default_index_dtype = "int32"
 
         for name, param in params.items():
             if param.kind in [
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
             ]:
-                args.append(tvm.tir.Var(name, default_index_dtype))
+                args.append(tvm.tir.Var(name, index_dtype))
 
             elif param.kind == inspect.Parameter.VAR_POSITIONAL:
                 var_arg_name = name
 
             elif param.kind == inspect.Parameter.KEYWORD_ONLY:
-                kwargs[name] = tvm.tir.Var(name, default_index_dtype)
+                kwargs[name] = tvm.tir.Var(name, index_dtype)
 
             else:
                 raise ValueError("transform_layout mapping may not have *args")
@@ -424,7 +397,7 @@ class IndexMap(Object):
             assert ndim is not None, "ndim must be specified when *args is used"
             num_var_args = ndim - len(args) - len(kwargs)
             for i in range(num_var_args):
-                args.append(tvm.tir.Var(f"{var_arg_name}_{i}", default_index_dtype))
+                args.append(tvm.tir.Var(f"{var_arg_name}_{i}", index_dtype))
 
         mapping = mapping_function(*args, **kwargs)
 

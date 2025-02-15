@@ -15,8 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 """Local Runner"""
+import logging
 from contextlib import contextmanager
 from typing import Callable, List, Optional, Union
+import subprocess
 
 import tvm
 
@@ -272,11 +274,16 @@ class LocalRunner(PyRunner):
         self.f_run_evaluator = f_run_evaluator
         self.f_cleanup = f_cleanup
 
+        err_path = subprocess.DEVNULL
+        if logger.root.level <= logging.DEBUG:
+            err_path = subprocess.STDOUT
+
         logger.info("LocalRunner: max_workers = 1")
         self.pool = PopenPoolExecutor(
             max_workers=1,  # one local worker
             timeout=timeout_sec,
             initializer=initializer,
+            stderr=err_path,  # suppress the stderr output
         )
         self._sanity_check()
 
@@ -383,3 +390,15 @@ def default_run_evaluator(
 def default_cleanup() -> None:
     """Default function to clean up the session"""
     pass  # pylint: disable=unnecessary-pass
+
+
+@tvm.register_func("meta_schedule.runner.get_local_runner")
+def get_local_builder() -> LocalRunner:
+    """Get the local Runner.
+
+    Returns
+    -------
+    runner: LocalRunner
+        The local runner
+    """
+    return LocalRunner()

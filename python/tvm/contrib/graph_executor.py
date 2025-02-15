@@ -153,12 +153,29 @@ class GraphModule(object):
     def __init__(self, module):
         self.module = module
         self._set_input = module["set_input"]
+
+        # TODO(shingjan): The graph_executor in C doesn't have
+        # set_input/output_zero_copy implemented.
+        try:
+            self._set_input_zero_copy = module["set_input_zero_copy"]
+        except AttributeError:
+            self._set_input_zero_copy = lambda *_: (_ for _ in ()).throw(
+                Exception("set_input_zero_copy is not implemented for C graph executor")
+            )
+        try:
+            self._set_output_zero_copy = module["set_output_zero_copy"]
+        except AttributeError:
+            self._set_output_zero_copy = lambda *_: (_ for _ in ()).throw(
+                Exception("set_output_zero_copy is not implemented for C graph executor")
+            )
         self._run = module["run"]
         self._get_output = module["get_output"]
         self._get_input = module["get_input"]
         self._get_num_outputs = module["get_num_outputs"]
         self._get_input_index = module["get_input_index"]
+        self._get_output_index = module["get_output_index"]
         self._get_input_info = module["get_input_info"]
+        self._get_output_info = module["get_output_info"]
         self._get_num_inputs = module["get_num_inputs"]
         self._load_params = module["load_params"]
         self._share_params = module["share_params"]
@@ -172,7 +189,7 @@ class GraphModule(object):
            The input key
 
         value : the input value.
-           The input key
+           The input value
 
         params : dict of str to NDArray
            Additional arguments
@@ -180,7 +197,7 @@ class GraphModule(object):
         if key is not None:
             v = self._get_input(key)
             if v is None:
-                raise RuntimeError("Could not find '%s' in graph's inputs" % key)
+                raise RuntimeError(f"Could not find '{key}' in graph's inputs")
             v.copyfrom(value)
 
         if params:
@@ -194,6 +211,47 @@ class GraphModule(object):
                 val = self._get_input(k)
                 if val:
                     self._get_input(k).copyfrom(params[k])
+
+    def set_input_zero_copy(self, key=None, value=None, **params):
+        """Set inputs to the module via kwargs with zero memory copy
+
+        Parameters
+        ----------
+        key : int or str
+           The input key
+
+        value : the input value in DLPack
+           The input value
+
+        params : dict of str to NDArray
+           Additional arguments
+        """
+        if key is not None:
+            self._set_input_zero_copy(key, value)
+
+        if params:
+            keys = list(params.keys())
+
+            for k in keys:
+                # TODO(zhiics) Skip the weights for submodule in a better way.
+                # We should use ConstLoaderModule for initialization and remove
+                # params from set_input
+                val = self._get_input(k)
+                if val:
+                    self._set_input_zero_copy(k, params[k])
+
+    def set_output_zero_copy(self, key, value):
+        """Set outputs to the module with zero memory copy
+
+        Parameters
+        ----------
+        key : int or str
+           The output key
+
+        value : the output value in DLPack
+           The output value
+        """
+        self._set_output_zero_copy(key, value)
 
     def run(self, **input_dict):
         """Run forward execution of the graph
@@ -259,6 +317,21 @@ class GraphModule(object):
         """
         return self._get_input_index(name)
 
+    def get_output_index(self, name):
+        """Get outputs index via output name.
+
+        Parameters
+        ----------
+        name : str
+           The output key name
+
+        Returns
+        -------
+        index: int
+            The output index. -1 will be returned if the given output name is not found.
+        """
+        return self._get_output_index(name)
+
     def get_input_info(self):
         """Return the 'shape' and 'dtype' dictionaries of the graph.
 
@@ -282,6 +355,24 @@ class GraphModule(object):
         shape_dict = input_info["shape"]
         assert "dtype" in input_info
         dtype_dict = input_info["dtype"]
+
+        return shape_dict, dtype_dict
+
+    def get_output_info(self):
+        """Return the 'shape' and 'dtype' dictionaries of the graph.
+
+        Returns
+        -------
+        shape_dict : Map
+            Shape dictionary - {output_name: tuple}.
+        dtype_dict : Map
+            dtype dictionary - {output_name: dtype}.
+        """
+        output_info = self._get_output_info()
+        assert "shape" in output_info
+        shape_dict = output_info["shape"]
+        assert "dtype" in output_info
+        dtype_dict = output_info["dtype"]
 
         return shape_dict, dtype_dict
 

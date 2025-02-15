@@ -16,4 +16,15 @@
 # under the License.
 """Package tvm.script.ir_builder.ir"""
 from .frame import IRModuleFrame
-from .ir import ir_module
+from .ir import (
+    decl_function,
+    def_function,
+    ir_module,
+    module_attrs,
+    module_get_attr,
+    module_set_attr,
+    module_global_infos,
+    lookup_vdevice,
+    vdevice,
+    dummy_global_info,
+)

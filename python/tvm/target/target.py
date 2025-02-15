@@ -18,9 +18,11 @@
 import json
 import re
 import warnings
+from typing import Union
 
 import tvm._ffi
 from tvm._ffi import register_func as _register_func
+from tvm._ffi.runtime_ctypes import Device
 from tvm.runtime import Object, convert
 from tvm.runtime.container import String
 from tvm.ir.container import Map, Array
@@ -149,6 +151,28 @@ class Target(Object):
         return _ffi_api.WithHost(self, Target(host))
 
     @staticmethod
+    def from_device(device: Union[str, Device]) -> "Target":
+        """Detects Target associated with the given device. If the device does not exist,
+        there will be an Error.
+
+        Parameters
+        ----------
+        dev : Union[str, Device]
+            The device to detect the target for.
+            Supported device types: ["cuda", "metal", "rocm", "vulkan", "opencl", "cpu"]
+
+        Returns
+        -------
+        target : Target
+            The detected target.
+        """
+        from .detect_target import (  # pylint: disable=import-outside-toplevel
+            detect_target_from_device,
+        )
+
+        return detect_target_from_device(device)
+
+    @staticmethod
     def current(allow_none=True):
         """Returns the current target.
 
@@ -174,13 +198,31 @@ class Target(Object):
         return int(self.attrs["max_num_threads"])
 
     @property
+    def max_block_size_x(self):
+        """Returns the max block size in x-dimension from the target if it exists."""
+        return int(self.attrs["max_block_size_x"])
+
+    @property
+    def max_block_size_y(self):
+        """Returns the max block size in y-dimension from the target if it exists."""
+        return int(self.attrs["max_block_size_y"])
+
+    @property
     def thread_warp_size(self):
         """Returns the thread_warp_size from the target if it exists."""
         return int(self.attrs["thread_warp_size"])
 
     @property
+    def max_shared_memory_per_block(self):
+        return int(self.attrs["max_shared_memory_per_block"])
+
+    @property
     def max_function_args(self):
-        return int(self.attrs.get("max_function_args", -1))
+        return int(self.attrs.get("max_function_args", 0))
+
+    @property
+    def vtcm_capacity(self):
+        return int(self.attrs.get("vtcm-capacity", 0))
 
     @property
     def device_name(self):
@@ -216,8 +258,19 @@ class Target(Object):
         return list(self.attrs.get("libs", []))
 
     @property
+    def supports_cooperative_matrix(self):
+        if self.attrs.get("supports_cooperative_matrix", []):
+            return bool(self.attrs["supports_cooperative_matrix"])
+        else:
+            return False
+
+    @property
     def features(self):
         return TargetFeatures(self)
+
+    @property
+    def l2_cache_size_bytes(self):
+        return int(self.attrs.get("l2_cache_size_bytes", 0))
 
     def get_kind_attr(self, attr_name):
         """Get additional attribute about the target kind.
@@ -458,29 +511,6 @@ MICRO_SUPPORTED_MODELS = {
 }
 
 
-def micro(model="unknown", options=None):
-    """Returns a microTVM target.
-
-    Parameters
-    ----------
-    model : str
-        Canonically identifies the target device. This is typically a device board level name.
-        The allowed values are MICRO_SUPPORTED_MODELS.keys().
-    options : str or list of str
-        Additional options
-    """
-    if model not in MICRO_SUPPORTED_MODELS:
-        raise ValueError(f"Model {model} not supported by tvm.target.micro.")
-    opts = _merge_opts(
-        MICRO_SUPPORTED_MODELS[model] + [f"-model={model}"],
-        options,
-    )
-
-    # NOTE: in the future, the default micro target will be LLVM except when
-    # external dependencies are present.
-    return Target(" ".join(["c"] + opts))
-
-
 def arm_cpu(model="unknown", options=None):
     """Returns a ARM CPU target.
     This function will also download pre-tuned op parameters when there is none.
@@ -554,12 +584,6 @@ def rasp(options=None):
     return arm_cpu("rasp3b", options)
 
 
-def vta(model="unknown", options=None):
-    opts = ["-device=vta", "-keys=vta,cpu", "-model=%s" % model]
-    opts = _merge_opts(opts, options)
-    return Target(" ".join(["ext_dev"] + opts))
-
-
 def bifrost(model="unknown", options=None):
     """Return an ARM Mali GPU target (Bifrost architecture).
 
@@ -621,12 +645,12 @@ def riscv_cpu(model="sifive-u54", options=None):
     return Target(" ".join(["llvm"] + opts))
 
 
-def hexagon(cpu_ver="v66", **kwargs):
+def hexagon(cpu_ver="v68", **kwargs):
     """Returns a Hexagon target.
 
     Parameters
     ----------
-    cpu_ver : str (default: "v66")
+    cpu_ver : str (default: "v68")
         CPU version used for code generation. Not all allowed cpu str
         will be valid, LLVM will throw an error.
 
@@ -642,6 +666,8 @@ def hexagon(cpu_ver="v66", **kwargs):
         Whether to use IEEE HVX instructions
     num_cores : int (default: 4)
         The number of HVX threads. This attribute is required by meta scheduler.
+    vtcm_capacity: int (default: 0)
+        Hexagon VTCM capacity limitation. If the value is 0, the capacity is treated as unbounded.
 
     Note: Floating point support in HVX requires LLVM 14+.
     """
@@ -652,7 +678,7 @@ def hexagon(cpu_ver="v66", **kwargs):
     # in place of '-'.
 
     # Example compiler arguments
-    # llvm -mtriple=hexagon -mcpu=hexagonv66 -mattr=+hvxv66,+hvx-length128b
+    # llvm -mtriple=hexagon -mcpu=hexagonv68 -mattr=+hvxv68,+hvx-length128b
 
     def get_arch_version(cpu_ver):
         m = re.match(r"v([0-9]+).*", cpu_ver)
@@ -660,13 +686,25 @@ def hexagon(cpu_ver="v66", **kwargs):
         return int(m.group(1))
 
     # Check for valid codegen cpu
-    valid_hex = ["v65", "v66", "v67", "v67t", "v68", "v69"]
+    valid_hex = ["v65", "v66", "v67", "v67t", "v68", "v69", "v71", "v73", "v75"]
     try:
         cpu_ver = cpu_ver[cpu_ver.index("v") :].lower()
         assert cpu_ver in valid_hex
     except:
         msg = "{} is not a valid Hexagon version\nvalid versions include {}"
         raise ValueError(msg.format(cpu_ver, valid_hex)) from None
+
+    def get_vtcm_capacity(cpu_ver):
+        one_mb = 2**20
+        default_vtcm_sizes = {
+            "v65": one_mb // 4,
+            "v66": one_mb // 4,
+            "v68": 4 * one_mb,
+            "v69": 8 * one_mb,
+            "v73": 8 * one_mb,
+            "v75": 8 * one_mb,
+        }
+        return default_vtcm_sizes.get(cpu_ver, 0)
 
     # Target configuration:
     arch_version = get_arch_version(cpu_ver)
@@ -675,6 +713,7 @@ def hexagon(cpu_ver="v66", **kwargs):
         "llvm_options": None,
         "use_qfloat": arch_version >= 68,
         "use_ieee_fp": False,
+        "vtcm_capacity": get_vtcm_capacity(cpu_ver),
     }
     config.update(kwargs)
 
@@ -748,6 +787,7 @@ def hexagon(cpu_ver="v66", **kwargs):
 
     num_cores = config["num_cores"] if "num_cores" in kwargs else 4
     args_list.append("--num-cores=%d" % num_cores)
+    args_list.append("--vtcm-capacity=%d" % config["vtcm_capacity"])
 
     return Target(" ".join(["hexagon"] + args_list))
 

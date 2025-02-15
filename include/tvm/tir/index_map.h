@@ -102,8 +102,7 @@ class IndexMapNode : public Object {
    * \returns The indices in the output space.  Contains one value for
    * each expression in `final_indices`.
    */
-  Array<PrimExpr> MapIndices(const Array<PrimExpr>& indices,
-                             arith::Analyzer* analyzer = nullptr) const;
+  Array<PrimExpr> MapIndices(const Array<PrimExpr>& indices, arith::Analyzer* analyzer) const;
 
   /*! \brief Map a memory range to the output space
    *
@@ -121,7 +120,7 @@ class IndexMapNode : public Object {
    * \returns The ranges in the output space.  Contains one value for
    * each expression in `final_indices`.
    */
-  Array<Range> MapRanges(const Array<Range>& ranges, arith::Analyzer* analyzer = nullptr) const;
+  Array<Range> MapRanges(const Array<Range>& ranges, arith::Analyzer* analyzer) const;
 
   /*! \brief Map a buffer shape to the output space
    *
@@ -134,7 +133,7 @@ class IndexMapNode : public Object {
    * \returns The buffer shape in the output space.  Contains one
    * value for each expression in `final_indices`.
    */
-  Array<PrimExpr> MapShape(const Array<PrimExpr>& shape, arith::Analyzer* analyzer = nullptr) const;
+  Array<PrimExpr> MapShape(const Array<PrimExpr>& shape, arith::Analyzer* analyzer) const;
 
   /* \brief Map an NDArray according to this index map
    *
@@ -146,9 +145,11 @@ class IndexMapNode : public Object {
 
   /*!
    * \brief Convert to string representation in Python.
+   * \param f_name_map Optional function to specify the stringified name of the variables.
    * \return The stringified lambda expression in Python.
    */
-  String ToPythonString() const;
+  String ToPythonString(
+      const std::function<Optional<String>(const Var& var)>& f_name_map = nullptr) const;
 
   void VisitAttrs(AttrVisitor* v) {
     v->Visit("initial_indices", &initial_indices);
@@ -201,7 +202,18 @@ class IndexMap : public ObjectRef {
    * If the user has supplied an `inverse_index_map`, that map is
    * assumed to be correct and bijective, and is returned.
    */
-  IndexMap Inverse(Array<Range> initial_ranges) const;
+  IndexMap Inverse(Array<Range> initial_ranges, arith::Analyzer* analyzer) const;
+
+  /*! \brief Rename the variables in the index map and ensure the names are unique.
+   *
+   * Construct a new index map with the same transformation, but with name_hint of variables to be
+   * guaranteed unique. The optional f_name_map can be provided to rename the variables.
+   *
+   * \param f_name_map The optional name map to rename the variables.
+   * \return The renamed index map.
+   */
+  IndexMap RenameVariables(
+      const std::function<Optional<String>(const Var& var)>& f_name_map = nullptr) const;
 
   /*! \brief Generate the inverse mapping.
    *
@@ -212,10 +224,19 @@ class IndexMap : public ObjectRef {
    * \return The inverted index map, along with the predicate for
    * which the inverse maps to a valid range.
    */
-  std::pair<IndexMap, PrimExpr> NonSurjectiveInverse(Array<Range> initial_ranges) const;
+  std::pair<IndexMap, PrimExpr> NonSurjectiveInverse(Array<Range> initial_ranges,
+                                                     arith::Analyzer* analyzer) const;
 
   TVM_DEFINE_OBJECT_REF_METHODS(IndexMap, ObjectRef, IndexMapNode);
 };
+
+/*! \brief Substitute variables in an index map.
+ *
+ * \param index_map The index_map
+ * \param f_subst The substitution function
+ */
+IndexMap Substitute(const IndexMap& index_map,
+                    std::function<Optional<PrimExpr>(const Var& var)> f_subst);
 
 }  // namespace tir
 }  // namespace tvm

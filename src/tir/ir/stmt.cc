@@ -27,6 +27,7 @@
 #include <tvm/tir/stmt.h>
 
 #include "buffer_common.h"
+#include "utils.h"
 
 namespace tvm {
 namespace tir {
@@ -59,18 +60,17 @@ TVM_REGISTER_GLOBAL("tir.LetStmt")
 
 TVM_REGISTER_NODE_TYPE(LetStmtNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<LetStmtNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const LetStmtNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "let " << op->var << " = ";
-      p->Print(op->value);
-      p->stream << '\n';
-      p->Print(op->body);
-    });
-
 // AttrStmt
 AttrStmt::AttrStmt(ObjectRef node, String attr_key, PrimExpr value, Stmt body, Span span) {
+  // The nodes are not required to be a TIR type, and may legally
+  // contain any ObjectRef.  However, normalizing to an IR type if
+  // possible prevents spurious discrepancies in StructuralEqual().
+  if (auto opt = node.as<runtime::Bool>()) {
+    node = Bool(opt.value());
+  } else if (auto opt = node.as<runtime::Int>()) {
+    node = Integer(opt.value());
+  }
+
   auto n = make_object<AttrStmtNode>();
   n->node = node;
   n->attr_key = std::move(attr_key);
@@ -87,21 +87,12 @@ TVM_REGISTER_GLOBAL("tir.AttrStmt")
 
 TVM_REGISTER_NODE_TYPE(AttrStmtNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<AttrStmtNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const AttrStmtNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "// attr [";
-      p->Print(op->node);
-      p->stream << "] " << op->attr_key << " = ";
-      p->Print(op->value);
-      p->stream << '\n';
-      p->Print(op->body);
-    });
-
 // AssertStmt
 AssertStmt::AssertStmt(PrimExpr condition, PrimExpr message, Stmt body, Span span) {
   ICHECK(condition.defined());
+  CHECK(condition.dtype().is_bool())
+      << "AssertStmt should have boolean condition, "
+      << "but received " << condition << " with dtype " << condition.dtype();
   ICHECK(message.dtype() == DataType::Int(32) || message.as<StringImmNode>())
       << "TypeError: AssertStmt message must be an int or string:" << message << "\n";
 
@@ -125,27 +116,23 @@ TVM_REGISTER_GLOBAL("tir.AssertStmt")
       }
     });
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<AssertStmtNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const AssertStmtNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "assert(";
-      p->Print(op->condition);
-      p->stream << ", ";
-      p->Print(op->message);
-      p->stream << ")\n";
-      p->Print(op->body);
-    });
-
 // For
 For::For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt body,
          Optional<IterVar> thread_binding, Map<String, ObjectRef> annotations, Span span) {
+  ICHECK(loop_var.defined());
   ICHECK(min.defined());
   ICHECK(extent.defined());
-  ICHECK(min.dtype().is_scalar());
-  ICHECK(extent.dtype().is_scalar());
-  ICHECK(loop_var.dtype().is_scalar());
   ICHECK(body.defined());
+
+  auto require_scalar_int_dtype = [&](PrimExpr expr, const char* field_name) {
+    auto dtype = expr.dtype();
+    CHECK(dtype.is_scalar() && (dtype.is_int() || dtype.is_uint()))
+        << "TIR For nodes require a scalar integer as the " << field_name << ", but received "
+        << expr << " with dtype " << dtype;
+  };
+  require_scalar_int_dtype(loop_var, "loop_var");
+  require_scalar_int_dtype(min, "min");
+  require_scalar_int_dtype(extent, "extent");
 
   // When extent or min is an IntImm but has narrower dtype than loop_var, we directly promote them
   // without raising errors.
@@ -166,6 +153,8 @@ For::For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt body,
 
   ICHECK(loop_var.dtype() == min.dtype()) << loop_var.dtype() << " vs " << min.dtype();
   ICHECK(loop_var.dtype() == extent.dtype()) << loop_var.dtype() << " vs " << extent.dtype();
+
+  annotations = Downcast<Map<String, ObjectRef>>(NormalizeAttributeObject(annotations));
 
   ObjectPtr<ForNode> node = make_object<ForNode>();
   node->loop_var = std::move(loop_var);
@@ -209,24 +198,6 @@ std::ostream& operator<<(std::ostream& out, ForKind type) {  // NOLINT(*)
   return out;
 }
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<ForNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const ForNode*>(node.get());
-      p->PrintIndent();
-      p->stream << op->kind << " (" << op->loop_var << ", ";
-      p->Print(op->min);
-      p->stream << ", ";
-      p->Print(op->extent);
-      p->stream << ") {\n";
-
-      p->indent += 2;
-      p->Print(op->body);
-      p->indent -= 2;
-
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
-
 // While
 While::While(PrimExpr condition, Stmt body, Span span) {
   ICHECK(condition.defined());
@@ -247,86 +218,6 @@ TVM_REGISTER_GLOBAL("tir.While").set_body_typed([](PrimExpr condition, Stmt body
 
 TVM_REGISTER_NODE_TYPE(WhileNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<WhileNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const WhileNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "while(" << op->condition << ") {\n";
-      p->indent += 2;
-      p->Print(op->body);
-      p->indent -= 2;
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
-
-// Store
-Store::Store(Var buffer_var, PrimExpr value, PrimExpr index, PrimExpr predicate, Span span) {
-  LOG(FATAL) << "Unexpected use of deprecated Store node for buffer " << buffer_var->name_hint
-             << ".  Use BufferStore instead.";
-  ICHECK(value.defined());
-  ICHECK(index.defined());
-  ICHECK(predicate.defined());
-
-  // Assume that the array elements have 1 lane, unless a type
-  // annotation tells us otherwise.
-  int element_lanes = 1;
-  auto pointer_type = tir::GetPointerType(buffer_var->type_annotation);
-  if (pointer_type.has_value()) {
-    // Currently cannot check element type of array, see Load::Load
-    // for details.
-
-    // TODO(Lunderberg): Uncomment this check once it can be applied.
-    // See https://discuss.tvm.apache.org/t/pre-rfc-vectorized-tir-buffers/10615
-    // for discussion.
-
-    // ICHECK_EQ(value.dtype().element_of(), pointer_type->element_of())
-    //     << "Type mismatch, cannot store type " << value.dtype() << " into buffer "
-    //     << buffer_var->name_hint << " of type " << pointer_type.value();
-    element_lanes = pointer_type->lanes();
-  }
-
-  ICHECK((value.dtype().lanes() == element_lanes * index.dtype().lanes()) ||
-         (value.dtype().lanes() == index.dtype().lanes()));
-  ICHECK((value.dtype().lanes() == element_lanes * predicate.dtype().lanes()) ||
-         (value.dtype().lanes() == index.dtype().lanes()));
-
-  ObjectPtr<StoreNode> node = make_object<StoreNode>();
-  node->buffer_var = std::move(buffer_var);
-  node->value = std::move(value);
-  node->index = std::move(index);
-  node->predicate = std::move(predicate);
-  node->span = std::move(span);
-  data_ = std::move(node);
-}
-
-TVM_REGISTER_GLOBAL("tir.Store").set_body([](TVMArgs args, TVMRetValue* ret) {
-  PrimExpr value = args[1];
-  if (args.size() == 3) {
-    *ret = Store(args[0], value, args[2], const_true(value.dtype().lanes()), Span());
-  } else if (args.size() == 4) {
-    *ret = Store(args[0], value, args[2], args[3], Span());
-  } else {
-    *ret = Store(args[0], value, args[2], args[3], args[4]);
-  }
-});
-
-TVM_REGISTER_NODE_TYPE(StoreNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<StoreNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const StoreNode*>(node.get());
-      p->PrintIndent();
-      p->stream << op->buffer_var << "[";
-      p->Print(op->index);
-      p->stream << "] = ";
-      p->Print(op->value);
-      if (!is_one(op->predicate)) {
-        p->stream << " if ";
-        p->Print(op->predicate);
-      }
-      p->stream << '\n';
-    });
-
 // ProducerStore
 ProducerStore::ProducerStore(DataProducer producer, PrimExpr value, Array<PrimExpr> indices,
                              Span span) {
@@ -345,21 +236,6 @@ TVM_REGISTER_GLOBAL("tir.ProducerStore")
 
 TVM_REGISTER_NODE_TYPE(ProducerStoreNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<ProducerStoreNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const ProducerStoreNode*>(node.get());
-      p->PrintIndent();
-      p->stream << op->producer->GetNameHint() << "[";
-      for (size_t i = 0; i < op->indices.size(); ++i) {
-        p->Print(op->indices[i]);
-        if (i < op->indices.size() - 1) p->stream << ", ";
-      }
-      p->stream << "]";
-      p->stream << " =";
-      p->Print(op->value);
-      p->stream << '\n';
-    });
-
 // Allocate
 Allocate::Allocate(Var buffer_var, DataType dtype, Array<PrimExpr> extents, PrimExpr condition,
                    Stmt body, Map<String, ObjectRef> annotations, Span span) {
@@ -377,6 +253,8 @@ Allocate::Allocate(Var buffer_var, DataType dtype, Array<PrimExpr> extents, Prim
   ICHECK(body.defined());
   ICHECK(condition.defined());
   ICHECK(condition.dtype().is_bool());
+
+  annotations = Downcast<Map<String, ObjectRef>>(NormalizeAttributeObject(annotations));
 
   ObjectPtr<AllocateNode> node = make_object<AllocateNode>();
   node->buffer_var = std::move(buffer_var);
@@ -412,26 +290,6 @@ TVM_REGISTER_GLOBAL("tir.Allocate")
 
 TVM_REGISTER_NODE_TYPE(AllocateNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<AllocateNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const AllocateNode*>(node.get());
-      const auto* ptr_type = op->buffer_var->type_annotation.as<PointerTypeNode>();
-      ICHECK(ptr_type) << "The provided variable is not of pointer type";
-      p->PrintIndent();
-      p->stream << "allocate " << op->buffer_var << "[" << op->dtype;
-      for (size_t i = 0; i < op->extents.size(); ++i) {
-        p->stream << " * ";
-        p->Print(op->extents[i]);
-      }
-      p->stream << "], storage_scope = " << ptr_type->storage_scope;
-      if (!is_one(op->condition)) {
-        p->stream << " if ";
-        p->Print(op->condition);
-      }
-      p->stream << "\n";
-      p->Print(op->body);
-    });
-
 // Const
 // The constructor to create a IRNode with constant data
 // depending on the type of ObjectRef, it will either
@@ -451,6 +309,8 @@ AllocateConst::AllocateConst(Var buffer_var, DataType dtype, Array<PrimExpr> ext
   }
   ICHECK(body.defined());
   ICHECK(data_or_idx.defined());
+
+  annotations = Downcast<Map<String, ObjectRef>>(NormalizeAttributeObject(annotations));
 
   ObjectPtr<AllocateConstNode> node = make_object<AllocateConstNode>();
   node->buffer_var = std::move(buffer_var);
@@ -494,20 +354,6 @@ TVM_REGISTER_GLOBAL("tir.AllocateConst")
 
 TVM_REGISTER_NODE_TYPE(AllocateConstNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<AllocateConstNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const AllocateConstNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "constant " << op->buffer_var << "[" << op->dtype;
-      for (size_t i = 0; i < op->extents.size(); ++i) {
-        p->stream << " * ";
-        p->Print(op->extents[i]);
-      }
-      p->stream << "]";
-      p->stream << "\n";
-      p->Print(op->body);
-    });
-
 // DeclBuffer
 DeclBuffer::DeclBuffer(Buffer buffer, Stmt body, Span span) {
   ObjectPtr<DeclBufferNode> node = make_object<DeclBufferNode>();
@@ -522,14 +368,6 @@ TVM_REGISTER_GLOBAL("tir.DeclBuffer").set_body_typed([](Buffer buffer, Stmt body
 });
 
 TVM_REGISTER_NODE_TYPE(DeclBufferNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<DeclBufferNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const DeclBufferNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "decl_buffer " << op->buffer << "\n";
-      p->stream << op->body;
-    });
 
 // ProducerRealize
 ProducerRealize::ProducerRealize(DataProducer producer, Region bounds, PrimExpr condition,
@@ -562,34 +400,6 @@ TVM_REGISTER_GLOBAL("tir.ProducerRealize")
 
 TVM_REGISTER_NODE_TYPE(ProducerRealizeNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<ProducerRealizeNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const ProducerRealizeNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "producer_realize " << op->producer->GetNameHint() << "(";
-      for (size_t i = 0; i < op->bounds.size(); ++i) {
-        p->stream << "[";
-        p->Print(op->bounds[i]->min);
-        p->stream << ", ";
-        p->Print(op->bounds[i]->extent);
-        p->stream << "]";
-        if (i < op->bounds.size() - 1) p->stream << ", ";
-      }
-      p->stream << ")";
-      if (!is_one(op->condition)) {
-        p->stream << " if ";
-        p->Print(op->condition);
-      }
-      p->stream << " {\n";
-
-      p->indent += 2;
-      p->Print(op->body);
-      p->indent -= 2;
-
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
-
 // Prefetch
 Prefetch::Prefetch(Buffer buffer, Array<Range> bounds, Span span) {
   data_ = make_object<PrefetchNode>(buffer, bounds, span);
@@ -602,24 +412,27 @@ TVM_REGISTER_GLOBAL("tir.Prefetch")
 
 TVM_REGISTER_NODE_TYPE(PrefetchNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<PrefetchNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const PrefetchNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "prefetch " << op->buffer << "(";
-      for (size_t i = 0; i < op->bounds.size(); ++i) {
-        p->stream << "[";
-        p->Print(op->bounds[i]->min);
-        p->stream << ", ";
-        p->Print(op->bounds[i]->extent);
-        p->stream << "]";
-        if (i < op->bounds.size() - 1) p->stream << ", ";
-      }
-      p->stream << ")";
-    });
-
 // SeqStmt
 SeqStmt::SeqStmt(Array<Stmt> seq, Span span) {
+  bool requires_flattening = std::any_of(
+      seq.begin(), seq.end(), [](const Stmt& stmt) { return stmt->IsInstance<SeqStmtNode>(); });
+
+  if (requires_flattening) {
+    auto flattened = SeqStmt::Flatten(seq);
+    if (auto* ptr = flattened.as<SeqStmtNode>()) {
+      seq = ptr->seq;
+    } else {
+      seq = {flattened};
+    }
+  }
+
+  ICHECK_NE(seq.size(), 0) << "An empty SeqStmt is prohibited.  "
+                           << "To write a no-op, use Evaluate(0), "
+                           << "or the result of SeqStmt::Flatten()";
+  ICHECK_NE(seq.size(), 1) << "A SeqStmt of length 1 is prohibited.  "
+                           << "Use the node " << seq[0] << "directly, "
+                           << "or for dynamic usage, normalize using SeqStmt::Flatten()";
+
   auto node = make_object<SeqStmtNode>();
   node->seq = std::move(seq);
   node->span = std::move(span);
@@ -632,16 +445,8 @@ TVM_REGISTER_GLOBAL("tir.SeqStmt").set_body_typed([](Array<Stmt> seq, Span span)
 
 TVM_REGISTER_NODE_TYPE(SeqStmtNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<SeqStmtNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const SeqStmtNode*>(node.get());
-      for (Stmt stmt : op->seq) {
-        p->Print(stmt);
-      }
-    });
-
 // IfThenElse
-IfThenElse::IfThenElse(PrimExpr condition, Stmt then_case, Stmt else_case, Span span) {
+IfThenElse::IfThenElse(PrimExpr condition, Stmt then_case, Optional<Stmt> else_case, Span span) {
   ICHECK(condition.defined());
   ICHECK(then_case.defined());
   // else_case may be null.
@@ -660,37 +465,6 @@ TVM_REGISTER_GLOBAL("tir.IfThenElse")
       return IfThenElse(condition, then_case, else_case, span);
     });
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<IfThenElseNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const IfThenElseNode*>(node.get());
-      p->PrintIndent();
-      while (true) {
-        p->stream << "if (" << op->condition << ") {\n";
-        p->indent += 2;
-        p->Print(op->then_case);
-        p->indent -= 2;
-
-        if (!op->else_case.defined()) {
-          break;
-        }
-
-        if (const IfThenElseNode* nested_if = op->else_case.as<IfThenElseNode>()) {
-          p->PrintIndent();
-          p->stream << "} else ";
-          op = nested_if;
-        } else {
-          p->PrintIndent();
-          p->stream << "} else {\n";
-          p->indent += 2;
-          p->Print(op->else_case);
-          p->indent -= 2;
-          break;
-        }
-      }
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
-
 // Evaluate
 Evaluate::Evaluate(PrimExpr value, Span span) {
   ICHECK(value.defined());
@@ -707,16 +481,9 @@ TVM_REGISTER_GLOBAL("tir.Evaluate").set_body_typed([](PrimExpr value, Span span)
 
 TVM_REGISTER_NODE_TYPE(EvaluateNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<EvaluateNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const EvaluateNode*>(node.get());
-      p->PrintIndent();
-      p->Print(op->value);
-      p->stream << "\n";
-    });
-
 // BufferStore
-BufferStore::BufferStore(Buffer buffer, PrimExpr value, Array<PrimExpr> indices, Span span) {
+BufferStore::BufferStore(Buffer buffer, PrimExpr value, Array<PrimExpr> indices,
+                         Optional<PrimExpr> predicate, Span span) {
   ICHECK_EQ(buffer->shape.size(), indices.size())
       << "Buffer " << buffer->name << " is " << buffer->shape.size()
       << "-dimensional, cannot be indexed with the " << indices.size()
@@ -727,43 +494,75 @@ BufferStore::BufferStore(Buffer buffer, PrimExpr value, Array<PrimExpr> indices,
         << "Only the last index of a buffer access may be a vector type.";
   }
 
-  int index_lanes = indices.size() ? indices.back().dtype().lanes() : 1;
-  int buffer_lanes = buffer->dtype.lanes();
+  bool is_index_scalable = indices.empty() ? false : indices.back().dtype().is_scalable_vector();
+  bool is_buffer_dtype_scalable = buffer->dtype.is_scalable_vector();
+  bool is_value_dtype_scalable = value.dtype().is_scalable_vector();
 
-  ICHECK_EQ(index_lanes * buffer_lanes, value.dtype().lanes())
-      << "Cannot store value with " << value.dtype().lanes() << ", expected value with "
+  ICHECK(!(is_index_scalable && is_buffer_dtype_scalable))
+      << "Index dtype and buffer dtype can't both be scalable.";
+
+  if (predicate.defined()) {
+    bool is_predicate_dtype_scalable = predicate.value().dtype().is_scalable_vector();
+    ICHECK_EQ(is_value_dtype_scalable, is_predicate_dtype_scalable)
+        << "Predicate mask dtype and value dtype must both be scalable.";
+  }
+
+  if (is_index_scalable || is_buffer_dtype_scalable) {
+    ICHECK(is_value_dtype_scalable) << "Can't store non-scalable data into scalable buffer";
+  }
+
+  int index_lanes = indices.empty() ? 1 : indices.back().dtype().get_lanes_or_vscale_factor();
+  int buffer_lanes = buffer->dtype.get_lanes_or_vscale_factor();
+  int value_dtype_lanes = value.dtype().get_lanes_or_vscale_factor();
+
+  ICHECK_EQ(index_lanes * buffer_lanes, value_dtype_lanes)
+      << "Cannot store value with " << value_dtype_lanes << ", expected value with "
       << index_lanes * buffer_lanes << " (" << index_lanes << " index lanes * " << buffer_lanes
       << " buffer element lanes)";
+
+  if (predicate.defined()) {
+    DataType predicate_dtype = predicate.value().dtype();
+    int predicate_dtype_lanes = predicate_dtype.get_lanes_or_vscale_factor();
+    ICHECK_EQ(value_dtype_lanes, predicate_dtype_lanes)
+        << "Got a predicate mask with " << predicate_dtype_lanes
+        << " lanes, but trying to store a value with " << value_dtype_lanes
+        << " lanes. The number of lanes must match.";
+
+    DataType predicate_element_dtype = predicate_dtype.element_of();
+    ICHECK(predicate_element_dtype.is_bool())
+        << "Predicate mask elements must be boolean values, but got " << predicate_element_dtype
+        << ".";
+  }
+
+  runtime::DataType buffer_dtype;
+  if (is_index_scalable || is_buffer_dtype_scalable) {
+    buffer_dtype = buffer->dtype.with_scalable_vscale_factor(buffer_lanes * index_lanes);
+  } else {
+    buffer_dtype = buffer->dtype.with_lanes(buffer_lanes * index_lanes);
+  }
+  if (buffer_dtype != value.dtype()) {
+    LOG(FATAL) << "TypeError: dtype mismatch on BufferStore: "      //
+               << "buffer's dtype is `" << buffer->dtype            //
+               << "`, the lanes of indexing are: `" << index_lanes  //
+               << "`, the scalability is: `" << buffer_dtype.is_scalable_vector()
+               << "`, but RHS's dtype is `" << value.dtype() << "`";
+  }
 
   ObjectPtr<BufferStoreNode> node = make_object<BufferStoreNode>();
   node->buffer = std::move(buffer);
   node->value = std::move(value);
   node->indices = std::move(indices);
+  node->predicate = std::move(predicate);
   node->span = std::move(span);
   data_ = std::move(node);
 }
 
 TVM_REGISTER_GLOBAL("tir.BufferStore")
-    .set_body_typed([](Buffer buffer, PrimExpr value, Array<PrimExpr> indices, Span span) {
-      return BufferStore(buffer, value, indices, span);
-    });
+    .set_body_typed([](Buffer buffer, PrimExpr value, Array<PrimExpr> indices,
+                       Optional<PrimExpr> predicate,
+                       Span span) { return BufferStore(buffer, value, indices, predicate, span); });
 
 TVM_REGISTER_NODE_TYPE(BufferStoreNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<BufferStoreNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const BufferStoreNode*>(node.get());
-      p->PrintIndent();
-      p->stream << op->buffer->name << "[";
-      for (size_t i = 0; i < op->indices.size(); ++i) {
-        p->Print(op->indices[i]);
-        if (i < op->indices.size() - 1) p->stream << ", ";
-      }
-      p->stream << "]";
-      p->stream << " = ";
-      p->Print(op->value);
-      p->stream << '\n';
-    });
 
 // BufferRealize
 BufferRealize::BufferRealize(Buffer buffer, Array<Range> bounds, PrimExpr condition, Stmt body,
@@ -776,34 +575,6 @@ TVM_REGISTER_GLOBAL("tir.BufferRealize")
                        Span span) { return BufferRealize(buffer, bounds, condition, body, span); });
 
 TVM_REGISTER_NODE_TYPE(BufferRealizeNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<BufferRealizeNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const BufferRealizeNode*>(node.get());
-      p->PrintIndent();
-      p->stream << "buffer_realize " << op->buffer->name << "(";
-      for (size_t i = 0; i < op->bounds.size(); ++i) {
-        p->stream << "[";
-        p->Print(op->bounds[i]->min);
-        p->stream << ", ";
-        p->Print(op->bounds[i]->extent);
-        p->stream << "]";
-        if (i < op->bounds.size() - 1) p->stream << ", ";
-      }
-      p->stream << ")";
-      if (!is_one(op->condition)) {
-        p->stream << " if ";
-        p->Print(op->condition);
-      }
-      p->stream << " {\n";
-
-      p->indent += 2;
-      p->Print(op->body);
-      p->indent -= 2;
-
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
 
 // BufferRegion
 BufferRegion::BufferRegion(Buffer buffer, Array<Range> region) {
@@ -842,23 +613,6 @@ TVM_REGISTER_GLOBAL("tir.BufferRegion").set_body_typed([](Buffer buffer, Array<R
 });
 
 TVM_REGISTER_NODE_TYPE(BufferRegionNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<BufferRegionNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const BufferRegionNode*>(node.get());
-      p->stream << op->buffer->name;
-      p->stream << "[";
-      for (size_t i = 0; i < op->region.size(); ++i) {
-        const auto& range = op->region[i];
-        p->Print(range->min);
-        if (!is_one(range->extent)) {
-          p->stream << ":";
-          p->Print(range->min + range->extent);
-        }
-        if (i != op->region.size() - 1) p->stream << ", ";
-      }
-      p->stream << "]";
-    });
 
 // MatchBufferRegion
 MatchBufferRegion::MatchBufferRegion(Buffer buffer, BufferRegion source) {
@@ -917,20 +671,13 @@ TVM_REGISTER_GLOBAL("tir.MatchBufferRegion").set_body_typed([](Buffer buffer, Bu
 
 TVM_REGISTER_NODE_TYPE(MatchBufferRegionNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<MatchBufferRegionNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const MatchBufferRegionNode*>(node.get());
-      p->PrintIndent();
-      p->stream << op->buffer->name << " = match_buffer(";
-      p->Print(op->source);
-      p->stream << ")\n";
-    });
-
 // Block
 Block::Block(Array<IterVar> iter_vars, Array<BufferRegion> reads, Array<BufferRegion> writes,
              String name_hint, Stmt body, Optional<Stmt> init, Array<Buffer> alloc_buffers,
              Array<MatchBufferRegion> match_buffers, Map<String, ObjectRef> annotations,
              Span span) {
+  annotations = Downcast<Map<String, ObjectRef>>(NormalizeAttributeObject(annotations));
+
   ObjectPtr<BlockNode> node = make_object<BlockNode>();
   node->iter_vars = std::move(iter_vars);
   node->reads = std::move(reads);
@@ -956,78 +703,6 @@ TVM_REGISTER_GLOBAL("tir.Block")
 
 TVM_REGISTER_NODE_TYPE(BlockNode);
 
-void PrintBlockTitle(const BlockNode* op, ReprPrinter* p) {
-  p->stream << "block " << op->name_hint << "(";
-  for (size_t i = 0; i < op->iter_vars.size(); i++) {
-    p->Print(op->iter_vars[i]);
-    if (i < op->iter_vars.size() - 1) p->stream << ", ";
-  }
-  p->stream << ")";
-}
-
-void PrintBlockSignature(const BlockNode* op, ReprPrinter* p) {
-  // print read/write regions
-  p->PrintIndent();
-  p->stream << "reads(";
-  p->Print(op->reads);
-  p->stream << ")\n";
-  p->PrintIndent();
-  p->stream << "writes(";
-  p->Print(op->writes);
-  p->stream << ")\n";
-  // Print alloc_buffers
-  for (const auto& alloc_buf : op->alloc_buffers) {
-    p->PrintIndent();
-    p->stream << alloc_buf->name << " = alloc_buffer(" << alloc_buf->dtype << "[";
-    for (size_t i = 0; i < alloc_buf->shape.size(); ++i) {
-      if (i > 0) p->stream << ", ";
-      p->Print(alloc_buf->shape[i]);
-    }
-    p->stream << "])\n";
-  }
-  // Print match_buffer_regions
-  for (const auto& match_buf : op->match_buffers) {
-    p->Print(match_buf);
-  }
-  if (!op->annotations.empty()) {
-    p->PrintIndent();
-    p->stream << "annotations(" << op->annotations << ")\n";
-  }
-}
-
-void PrintBlockBody(const BlockNode* op, ReprPrinter* p) {
-  // Print init
-  if (op->init.defined()) {
-    p->PrintIndent();
-    p->stream << "with init() {\n";
-    p->indent += 2;
-    p->Print(op->init.value());
-    p->indent -= 2;
-    p->PrintIndent();
-    p->stream << "}\n";
-  }
-  // Print body
-  p->Print(op->body);
-}
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<BlockNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const BlockNode*>(node.get());
-      p->PrintIndent();
-      PrintBlockTitle(op, p);
-      p->stream << " {\n";
-      p->indent += 2;
-
-      // Print block elements (e.g. reads/writes, etc)
-      PrintBlockSignature(op, p);
-      // Print block init and body
-      PrintBlockBody(op, p);
-
-      p->indent -= 2;
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
-
 // BlockRealize
 BlockRealize::BlockRealize(Array<PrimExpr> values, PrimExpr predicate, Block block, Span span) {
   CHECK_EQ(block->iter_vars.size(), values.size())
@@ -1048,48 +723,15 @@ TVM_REGISTER_GLOBAL("tir.BlockRealize")
 
 TVM_REGISTER_NODE_TYPE(BlockRealizeNode);
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<BlockRealizeNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const BlockRealizeNode*>(node.get());
-      auto* block_op = op->block.get();
-      p->PrintIndent();
-      PrintBlockTitle(block_op, p);
-      p->stream << " {\n";
-      p->indent += 2;
-
-      // Print binding iter_values
-      for (size_t i = 0; i < block_op->iter_vars.size(); ++i) {
-        p->PrintIndent();
-        p->stream << "bind(";
-        p->Print(block_op->iter_vars[i]->var);
-        p->stream << ", ";
-        p->Print(op->iter_values[i]);
-        p->stream << ")\n";
-      }
-      // Print predicate
-      if (!is_one(op->predicate)) {
-        p->PrintIndent();
-        p->stream << "where(";
-        p->Print(op->predicate);
-        p->stream << ")\n";
-      }
-      // Print block elements (e.g. reads/writes, etc)
-      PrintBlockSignature(block_op, p);
-      // Print block init and body
-      PrintBlockBody(block_op, p);
-
-      p->indent -= 2;
-      p->PrintIndent();
-      p->stream << "}\n";
-    });
-
 PrimExpr TypeAnnotation(DataType dtype, Span span) {
   static auto op = Op::Get("tir.type_annotation");
   return tir::Call(dtype, op, {}, span);
 }
 
-TVM_REGISTER_OP("tir.type_annotation")
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+TVM_TIR_REGISTER_OP("type_annotation")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptDtypePrintLocation>("TScriptDtypePrintLocation",
+                                         Integer(ScriptDtypePrintLocation::kFirst));
 
 }  // namespace tir
 }  // namespace tvm

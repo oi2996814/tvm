@@ -35,6 +35,10 @@
 #include "../codegen_json/codegen_json.h"
 
 namespace tvm {
+
+constexpr const char* kCLMLTargetVersion = "relay.ext.clml.target_version";
+TVM_REGISTER_PASS_CONFIG_OPTION(kCLMLTargetVersion, Integer);
+
 namespace relay {
 namespace contrib {
 
@@ -83,18 +87,18 @@ class CLMLJSONSerializer : public backend::contrib::JSONSerializer {
     ICHECK(comp.defined()) << "CLML JSON runtime only supports composite functions.";
     const std::string name = comp.value();
     std::shared_ptr<JSONGraphNode> json_node;
-    if (name == "clml.conv2d") {
+    if (name == "clml.conv2d" || name == "clml.pad_conv2d" || name == "clml.conv2d_transpose") {
       json_node = CreateCompositeConvJSONNode(cn);
     } else if (name == "clml.batch_norm") {
       json_node = CreateBatchNormJSONNode(cn);
-    } else if (name == "clml.dense") {
+    } else if (name == "clml.dense1d" || name == "clml.dense2d") {
       json_node = CreateDenseJSONNode(cn);
     } else if (name == "clml.pad") {
       json_node = CreatePadJSONNode(cn);
     } else if (name == "clml.concat") {
       json_node = CreateConcatJSONNode(cn);
     } else {
-      LOG(FATAL) << "Unrecognized CLML  pattern: " << name;
+      json_node = CreateGenericJSONNode(cn);
     }
     return AddNode(json_node, GetRef<Expr>(cn));
   }
@@ -164,12 +168,15 @@ class CLMLJSONSerializer : public backend::contrib::JSONSerializer {
       nodes.bn = current_call;
       current_call = current_call->args[0].as<CallNode>();
     }
-    if (backend::IsOp(current_call, "add")) {
+    if (backend::IsOp(current_call, "add") || backend::IsOp(current_call, "nn.bias_add")) {
       nodes.bias = current_call;
       current_call = current_call->args[0].as<CallNode>();
     }
     // Enforce a convolution node exists at this point during traversal
-    ICHECK(backend::IsOp(current_call, "nn.conv2d"));
+    if (!backend::IsOp(current_call, "nn.conv2d") &&
+        !backend::IsOp(current_call, "nn.conv2d_transpose")) {
+      LOG(FATAL) << "Can't find primary op in Convolution node";
+    }
     nodes.conv = current_call;
     if (!current_call->args.empty() && current_call->args[0]->IsInstance<CallNode>()) {
       current_call = current_call->args[0].as<CallNode>();
@@ -189,22 +196,27 @@ class CLMLJSONSerializer : public backend::contrib::JSONSerializer {
   std::shared_ptr<JSONGraphNode> CreateCompositeConvJSONNode(const CallNode* cn) {
     CompositeConvNode nodes = UnpackCompositeConvolution(cn);
 
-    const auto* conv_attr = nodes.conv->attrs.as<Conv2DAttrs>();
-    ICHECK(conv_attr);
-
     std::string name;
     std::string name_prefix = "nn";
-
-    // Distinguish between normal and depth-wise convolution
-    if (conv_attr->channels.defined() &&
-        tvm::tir::ExprDeepEqual()(conv_attr->channels, conv_attr->groups) &&
-        conv_attr->groups != 1) {
-      name = "depthwise_conv2d";
-      ICHECK(conv_attr->kernel_layout == "IOHW")
-          << "Kernel layout must be IHWO, has the module been pre-processed correctly?";
-    } else {
-      name = "conv2d";
-      ICHECK(conv_attr->kernel_layout == "OIHW")
+    if (backend::IsOp(nodes.conv, "nn.conv2d")) {
+      const auto* conv_attr = nodes.conv->attrs.as<Conv2DAttrs>();
+      ICHECK(conv_attr);
+      if (conv_attr->channels.defined() &&
+          tvm::tir::ExprDeepEqual()(conv_attr->channels, conv_attr->groups) &&
+          conv_attr->groups != 1) {
+        name = "depthwise_conv2d";
+        ICHECK(conv_attr->kernel_layout == "IOHW")
+            << "Kernel layout must be IHWO, has the module been pre-processed correctly?";
+      } else {
+        name = "conv2d";
+        ICHECK(conv_attr->kernel_layout == "OIHW")
+            << "Kernel layout must be OHWI, has the module been pre-processed correctly?";
+      }
+    } else if (backend::IsOp(nodes.conv, "nn.conv2d_transpose")) {
+      name = "conv2d_transpose";
+      const auto* conv_transpose_attr = nodes.conv->attrs.as<Conv2DTransposeAttrs>();
+      ICHECK(conv_transpose_attr);
+      ICHECK(conv_transpose_attr->kernel_layout == "OIHW")
           << "Kernel layout must be OHWI, has the module been pre-processed correctly?";
     }
 
@@ -328,7 +340,7 @@ class CLMLJSONSerializer : public backend::contrib::JSONSerializer {
     const auto* dense = fn->body.as<CallNode>();
     const CallNode* bias = nullptr;
 
-    if (backend::IsOp(dense, "add")) {
+    if (backend::IsOp(dense, "add") || backend::IsOp(dense, "nn.bias_add")) {
       bias = dense;
       dense = dense->args[0].as<CallNode>();
     }
@@ -385,6 +397,28 @@ class CLMLJSONSerializer : public backend::contrib::JSONSerializer {
     pad_mode_attr.emplace_back(pad_mode);
     json_node->SetAttr("pad_mode", pad_mode_attr);
 
+    return json_node;
+  }
+
+  std::shared_ptr<JSONGraphNode> CreateGenericJSONNode(const CallNode* cn) {
+    const auto* fn = cn->op.as<FunctionNode>();
+    ICHECK(fn);
+    const auto* node = fn->body.as<CallNode>();
+
+    const auto* node_op = node->op.as<OpNode>();
+    ICHECK(node_op);
+    const std::string name = node_op->name;
+
+    std::vector<JSONGraphNodeEntry> inputs;
+    unsigned int i = 0;
+    for (i = 0; i < cn->args.size(); i++) {
+      inputs.push_back(VisitExpr(cn->args[i])[0]);
+    }
+    for (unsigned int j = i; j < node->args.size(); j++) {
+      inputs.push_back(VisitExpr(node->args[j])[0]);
+    }
+    auto json_node = std::make_shared<JSONGraphNode>(name, "kernel", inputs, 1);
+    SetCallNodeAttribute(json_node, node);
     return json_node;
   }
 };

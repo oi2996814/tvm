@@ -22,9 +22,13 @@
  * \brief Native threading backend
  */
 #include <tvm/runtime/logging.h>
+#include <tvm/runtime/registry.h>
 #include <tvm/runtime/threading_backend.h>
 
 #if defined(__linux__) || defined(__ANDROID__)
+#if __ANDROID_API__ >= 21
+#include <pthread.h>
+#endif
 #include <fstream>
 #include <sstream>
 #else
@@ -103,6 +107,39 @@ class QuRTThread {
   void* stack_ = nullptr;
 };
 #endif  // __hexagon__
+
+// This is a common function used to set thread affinity.
+void SetThreadAffinity(std::thread::native_handle_type thread,
+                       const std::vector<unsigned int>& ids) {
+#if defined(__linux__) || defined(__ANDROID__)
+  if (pthread_equal(thread, CURRENT_THREAD_HANDLE)) {
+    thread = pthread_self();
+  }
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  for (auto id : ids) {
+    CPU_SET(id, &cpuset);
+  }
+#if defined(__ANDROID__)
+#if __ANDROID_API__ >= 21
+  pid_t tid = pthread_gettid_np(thread);
+#else
+  typedef struct {
+    void* next;
+    void* pred;
+    pid_t tid;
+  } pthread_internal;
+  pid_t tid = reinterpret_cast<pthread_internal*>(thread)->tid;
+#endif
+  if (sched_setaffinity(tid, sizeof(cpu_set_t), &cpuset) != 0) {
+    LOG(WARNING) << "sched_setaffinity failed";
+  }
+#else
+  pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+#endif
+#endif
+}
+
 thread_local int max_concurrency = 0;
 class ThreadGroup::Impl {
  public:
@@ -155,25 +192,6 @@ class ThreadGroup::Impl {
   }
 
  private:
-  void SetThreadAffinity(std::thread::native_handle_type thread,
-                         const std::vector<unsigned int>& ids) {
-#if defined(__linux__) || defined(__ANDROID__)
-    if (pthread_equal(thread, CURRENT_THREAD_HANDLE)) {
-      thread = pthread_self();
-    }
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    for (auto id : ids) {
-      CPU_SET(id, &cpuset);
-    }
-#if defined(__ANDROID__)
-    sched_setaffinity(thread, sizeof(cpu_set_t), &cpuset);
-#else
-    pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-#endif
-#endif
-  }
-
   // bind worker threads to disjoint cores
   // if worker 0 is offloaded to main, i.e. exclude_worker0 is true,
   // the main thread is bound to core 0.
@@ -291,7 +309,11 @@ class ThreadGroup::Impl {
       int64_t cur_freq = 0;
 #if defined(__linux__) || defined(__ANDROID__)
       std::ostringstream filepath;
-      filepath << "/sys/devices/system/cpu/cpu" << i << "/cpufreq/scaling_max_freq";
+      // according to https://www.kernel.org/doc/Documentation/cpu-freq/user-guide.txt
+      // it's better to use cpuinfo_max_freq instead of scaling_max_freq for our
+      // purposes since scaling values can be changed dynamically according "policy limits"
+      // while we are looking for persistent definition of cores
+      filepath << "/sys/devices/system/cpu/cpu" << i << "/cpufreq/cpuinfo_max_freq";
       std::ifstream ifs(filepath.str());
       if (!ifs.fail()) {
         if (!(ifs >> cur_freq)) {
@@ -307,7 +329,7 @@ class ThreadGroup::Impl {
                          const std::pair<unsigned int, int64_t>& b) {
       return a.second == b.second ? a.first < b.first : a.second > b.second;
     };
-    std::sort(max_freqs.begin(), max_freqs.end(), fcmpbyfreq);
+    std::stable_sort(max_freqs.begin(), max_freqs.end(), fcmpbyfreq);
     int64_t big_freq = max_freqs.begin()->second;
     int64_t little_freq = max_freqs.rbegin()->second;
     for (auto it = max_freqs.begin(); it != max_freqs.end(); it++) {
@@ -320,7 +342,8 @@ class ThreadGroup::Impl {
       }
     }
     if (big_count_ + little_count_ != static_cast<int>(sorted_order_.size())) {
-      LOG(WARNING) << "more than two frequencies detected!";
+      big_count_ = static_cast<int>(sorted_order_.size()) - little_count_;
+      LOG(WARNING) << "more than two frequencies detected! Forced big_count_ to " << big_count_;
     }
   }
 
@@ -410,6 +433,14 @@ int MaxConcurrency() {
   }
   return std::max(max_concurrency, 1);
 }
+
+// This global function can be used by disco runtime to bind processes
+// to CPUs.
+TVM_REGISTER_GLOBAL("tvm.runtime.threading.set_current_thread_affinity")
+    .set_body_typed([](IntTuple cpu_ids) {
+      SetThreadAffinity(CURRENT_THREAD_HANDLE,
+                        std::vector<unsigned int>{cpu_ids.begin(), cpu_ids.end()});
+    });
 
 }  // namespace threading
 }  // namespace runtime

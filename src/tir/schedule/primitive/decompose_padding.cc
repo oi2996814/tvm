@@ -114,6 +114,10 @@ class PaddingInfoAnalyzer {
 
     // Step 3. Analyze in-bound write region.
     PrimExpr in_bound_predicate = RewritePredicate(pad_predicate && realize->predicate);
+    if (analyzer_->CanProveEqual(in_bound_predicate, 1)) {
+      SetError("The in-bound predicate is trivial");
+      return false;
+    }
     Array<Range> in_bound_region = this->EstimateInBoundRegion(
         /*iter_values=*/realize->iter_values, /*dom_map=*/dom_map,
         /*in_bound_predicate=*/in_bound_predicate);
@@ -164,7 +168,7 @@ class PaddingInfoAnalyzer {
     }
     for (const arith::IterSumExpr& sum : res->indices) {
       if (sum->args.empty()) {
-        region.push_back(Range::FromMinExtent(sum->base, 1));
+        region.push_back(Range::FromMinExtent(sum->base, IntImm(sum->base.dtype(), /* value */ 1)));
       } else {
         ICHECK_EQ(sum->args.size(), 1U);
         if (!analyzer_->CanProveEqual(sum->args[0]->scale, 1)) {
@@ -287,10 +291,10 @@ static std::pair<Stmt, BlockRealize> CreateInBoundBlock(const BlockRealizeNode* 
     repl_dict.Set(origin_itervar->var, new_var + info.in_bound_region[i]->min);
 
     // update new loop range
-    Var loop_var = GetRef<Var>(realize->iter_values[i].as<VarNode>());
-    if (loop_var.defined() && new_loop_ranges.count(loop_var)) {
+    if (auto opt = realize->iter_values[i].as<Var>(); opt && new_loop_ranges.count(opt.value())) {
       // if the block binding is the loop var with single child, mutate loop range
       // instead of insert extra block predicate
+      auto loop_var = opt.value();
       new_loop_ranges.Set(loop_var, new_range);
       new_iter_binding.push_back(realize->iter_values[i]);
       repl_dict.Set(loop_var, loop_var + info.in_bound_region[i]->min);
@@ -389,15 +393,6 @@ class DecomposePaddingBlockReplacer : public StmtMutator {
     return std::move(new_loop);
   }
 
-  Stmt VisitStmt_(const SeqStmtNode* seq) final {
-    Array<Stmt> new_stmts;
-    new_stmts.reserve(seq->seq.size());
-    for (const Stmt& old_stmt : seq->seq) {
-      new_stmts.push_back(VisitStmt(old_stmt));
-    }
-    return SeqStmt::Flatten(new_stmts);
-  }
-
  private:
   const ReplaceDesc& desc_;
 };
@@ -439,13 +434,14 @@ StmtSRef DecomposePaddingImpl(ScheduleState self, const StmtSRef& block_sref,
     analyzer.Bind(cur_loop->loop_var, range);
     loops.push_back(cur_loop);
 
-    if (!found_const_filling_pos) {
-      if (cur_loop.same_as(const_filling_pos)) {
-        found_const_filling_pos = true;
+    if (cur_loop.same_as(const_filling_pos)) {
+      ICHECK(!found_const_filling_pos);
+      found_const_filling_pos = true;
+      if (!found_in_bound_filling_pos) {
+        found_in_bound_filling_pos = true;
+        in_bound_filling_pos = cur_loop;
       }
-    }
-
-    if (!found_in_bound_filling_pos) {
+    } else if (!found_in_bound_filling_pos) {
       if (!cur_loop->body->IsInstance<ForNode>() &&
           !cur_loop->body->IsInstance<BlockRealizeNode>()) {
         found_in_bound_filling_pos = true;
@@ -491,7 +487,7 @@ StmtSRef DecomposePaddingImpl(ScheduleState self, const StmtSRef& block_sref,
   BlockInfo& block_info = self->block_info[new_block_sref];
   block_info.affine_binding = true;
   block_info.region_cover = true;
-  block_info.scope->stage_pipeline = true;
+  block_info.stage_pipeline = true;
 
   // If the const pad value filling block is lifted out of the original subtree,
   // set the region_cover flag as false since region_cover is the property under the subtree.
@@ -513,7 +509,7 @@ StmtSRef DecomposePaddingImpl(ScheduleState self, const StmtSRef& block_sref,
     }
   }
   if (!preserve_stage_pipeline) {
-    self->block_info[scope_root_sref].scope->stage_pipeline = false;
+    self->block_info[scope_root_sref].stage_pipeline = false;
   }
   return new_block_sref;
 }

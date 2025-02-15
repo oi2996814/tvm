@@ -130,8 +130,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
                 dtype=kernel_tensor.dtype,
             )
             new_workload = autotvm.task.args_to_workload(
-                [new_data, new_weight, strides, padding, dilation, out_dtype],
-                wkl_name,
+                [new_data, new_weight, strides, padding, dilation, out_dtype], wkl_name
             )
             dispatch_ctx.update(target, new_workload, cfg)
             return relay.nn.contrib_conv2d_winograd_without_weight_transform(
@@ -143,8 +142,11 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
         CO, _, KH, KW = get_const_tuple(kernel_tensor.shape)
 
         # pre-compute weight transformation in winograd
+        # alpha, alpha, CO, CI
         weight = relay.nn.contrib_conv2d_winograd_weight_transform(inputs[1], tile_size=tile_size)
         weight = relay.transpose(weight, axes=[2, 3, 0, 1])  # HWOI -> OIHW
+        # (oc, ic, h, w) -> (h, w, ic, oc)
+        new_attrs["kernel_layout"] = "HWIO"
         new_attrs["tile_size"] = tile_size
         new_attrs["channels"] = CO
 
@@ -162,18 +164,17 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
 
         if in_channel_block != 4 or num_filter_block != 4:
             new_workload = autotvm.task.args_to_workload(
-                [new_data, new_weight, strides, padding, dilation, out_dtype],
-                wkl_name,
+                [new_data, new_weight, strides, padding, dilation, out_dtype], wkl_name
             )
             dispatch_ctx.update(target, new_workload, cfg)
             return relay.nn.contrib_conv2d_winograd_without_weight_transform(
                 inputs[0], weight, **new_attrs
             )
 
-        new_attrs["data_layout"] = "NCHW%dc" % in_channel_block
+        new_attrs["data_layout"] = f"NCHW{in_channel_block}c"
         # (oc, ic, h, w) -> (h, w, ic, oc // 4, oc % 4)
-        new_attrs["kernel_layout"] = "HWIO%do" % num_filter_block
-        new_attrs["out_layout"] = "NCHW%dc" % num_filter_block
+        new_attrs["kernel_layout"] = f"HWIO{num_filter_block}o"
+        new_attrs["out_layout"] = f"NCHW{num_filter_block}c"
         # Store altered operator's config
         new_data = te.placeholder(
             (N, CI // in_channel_block, H, W, in_channel_block), dtype=data_dtype
@@ -183,15 +184,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
             dtype=kernel_tensor.dtype,
         )
         new_workload = autotvm.task.args_to_workload(
-            [
-                new_data,
-                new_weight,
-                strides,
-                padding,
-                dilation,
-                out_dtype,
-            ],
-            wkl_name,
+            [new_data, new_weight, strides, padding, dilation, out_dtype], wkl_name
         )
         dispatch_ctx.update(target, new_workload, cfg)
         return relay.nn.contrib_conv2d_winograd_without_weight_transform(
@@ -223,8 +216,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
                 dtype=kernel_tensor.dtype,
             )
             new_workload = autotvm.task.args_to_workload(
-                [new_data, new_weight, strides, padding, dilation, out_dtype],
-                wkl_name,
+                [new_data, new_weight, strides, padding, dilation, out_dtype], wkl_name
             )
             dispatch_ctx.update(target, new_workload, cfg)
             return relay.nn.contrib_conv2d_winograd_without_weight_transform(
@@ -256,18 +248,17 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
 
         if in_channel_block != 4 or num_filter_block != 4:
             new_workload = autotvm.task.args_to_workload(
-                [new_data, new_weight, strides, padding, dilation, out_dtype],
-                wkl_name,
+                [new_data, new_weight, strides, padding, dilation, out_dtype], wkl_name
             )
             dispatch_ctx.update(target, new_workload, cfg)
             return relay.nn.contrib_conv2d_winograd_without_weight_transform(
                 inputs[0], weight, **new_attrs
             )
 
-        new_attrs["data_layout"] = "NHWC%dc" % in_channel_block
+        new_attrs["data_layout"] = f"NHWC{in_channel_block}c"
         # (oc, ic, h, w) -> (h, w, ic, oc // 4, oc % 4)
-        new_attrs["kernel_layout"] = "HWIO%do" % num_filter_block
-        new_attrs["out_layout"] = "NHWC%dc" % num_filter_block
+        new_attrs["kernel_layout"] = f"HWIO{num_filter_block}o"
+        new_attrs["out_layout"] = f"NHWC{num_filter_block}c"
         # Store altered operator's config
         new_data = te.placeholder(
             (N, H, W, CI // in_channel_block, in_channel_block), dtype=data_dtype
@@ -277,15 +268,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
             dtype=kernel_tensor.dtype,
         )
         new_workload = autotvm.task.args_to_workload(
-            [
-                new_data,
-                new_weight,
-                strides,
-                padding,
-                dilation,
-                out_dtype,
-            ],
-            wkl_name,
+            [new_data, new_weight, strides, padding, dilation, out_dtype], wkl_name
         )
         dispatch_ctx.update(target, new_workload, cfg)
         return relay.nn.contrib_conv2d_winograd_without_weight_transform(
@@ -313,12 +296,12 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
             # update new attrs
             new_attrs["channels"] = out_channel
             if in_channel_block == 4:
-                new_attrs["data_layout"] = "NCHW%dc" % in_channel_block
+                new_attrs["data_layout"] = f"NCHW{in_channel_block}c"
             else:
                 new_attrs["data_layout"] = "NCHW"
             # (oc, ic, h, w) -> (OC, ic, h, w, oc)
-            new_attrs["kernel_layout"] = "OIHW%do" % num_filter_block
-            new_attrs["out_layout"] = "NCHW%dc" % num_filter_block
+            new_attrs["kernel_layout"] = f"OIHW{num_filter_block}o"
+            new_attrs["out_layout"] = f"NCHW{num_filter_block}c"
 
             # Store altered operator's config for applying of tuned AutoTVM statistics
             if in_channel_block == 4:
@@ -333,14 +316,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
                 dtype=kernel_tensor.dtype,
             )
             new_workload = autotvm.task.args_to_workload(
-                [
-                    new_data,
-                    new_kernel,
-                    strides,
-                    padding,
-                    dilation,
-                    out_dtype,
-                ],
+                [new_data, new_kernel, strides, padding, dilation, out_dtype],
                 topi_tmpl,  # "conv2d_nchwc.image2d",
             )
             dispatch_ctx.update(target, new_workload, cfg)
@@ -373,15 +349,15 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
             # update new attrs
             new_attrs["channels"] = out_channles
             if in_channel_block == 4:
-                new_attrs["data_layout"] = "NHWC%dc" % in_channel_block
+                new_attrs["data_layout"] = f"NHWC{in_channel_block}c"
             else:
                 new_attrs["data_layout"] = "NHWC"
             # (h, w, ic, oc) -> (h, w, ic, OC, oc)
             if kernel_layout == "HWIO":
-                new_attrs["kernel_layout"] = "HWIO%do" % num_filter_block
+                new_attrs["kernel_layout"] = f"HWIO{num_filter_block}o"
             else:
-                new_attrs["kernel_layout"] = "HWOI%do" % num_filter_block
-            new_attrs["out_layout"] = "NHWC%dc" % num_filter_block
+                new_attrs["kernel_layout"] = f"HWOI{num_filter_block}o"
+            new_attrs["out_layout"] = f"NHWC{num_filter_block}c"
 
             # Store altered operator's config for applying of tuned AutoTVM statistics
             if in_channel_block == 4:
@@ -420,15 +396,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
                     dtype=kernel_tensor.dtype,
                 )
             new_workload = autotvm.task.args_to_workload(
-                [
-                    new_data,
-                    new_kernel,
-                    strides,
-                    padding,
-                    dilation,
-                    out_dtype,
-                ],
-                topi_tmpl,
+                [new_data, new_kernel, strides, padding, dilation, out_dtype], topi_tmpl
             )
             dispatch_ctx.update(target, new_workload, cfg)
         else:

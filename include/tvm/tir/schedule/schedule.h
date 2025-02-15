@@ -115,6 +115,8 @@ class ScheduleNode : public runtime::Object {
   virtual ScheduleState state() const = 0;
   /*! \return The internally maintained trace of scheduling program execution */
   virtual Optional<Trace> trace() const = 0;
+  /*! \return The GlobalVar of the func that the schedule is currently working on */
+  virtual Optional<GlobalVar> func_working_on() const = 0;
   /*!
    * \brief Instruct the schedule to work on a function in the IRModule.
    *
@@ -222,8 +224,9 @@ class ScheduleNode : public runtime::Object {
    * \param decision The sampling decision
    * \return The random variable sampled from candidates
    */
-  virtual ExprRV SampleCategorical(const Array<Integer>& candidates, const Array<FloatImm>& probs,
-                                   Optional<Integer> decision = NullOpt) = 0;
+  virtual ExprRV SampleCategorical(const Array<runtime::Int>& candidates,
+                                   const Array<runtime::Float>& probs,
+                                   Optional<runtime::Int> decision = NullOpt) = 0;
   /*!
    * \brief Sample the factors to perfect tile a specific loop
    * \param loop_rv The loop to be tiled
@@ -234,6 +237,24 @@ class ScheduleNode : public runtime::Object {
    */
   virtual Array<ExprRV> SamplePerfectTile(const LoopRV& loop_rv, int n, int max_innermost_factor,
                                           Optional<Array<Integer>> decision = NullOpt) = 0;
+  /*!
+   * \brief Sample the factors to a partitioned tile for a specific loop
+   *
+   *  The sampled tile size will be partitioned into two parts. The second part has a guarantee
+   *  that their extent's product have a factor of `innerpart_factor`. The first part is loops at
+   *  [0, partition_pos); the second part is loops at [partition_pos, n) and we will have
+   *  `innerpart_factor` | (l[partition_pos].extent * ... * l[n-1].extent)
+   *
+   * \param loop_rv The loop to be tiled
+   * \param n The number of tiles to be sampled
+   * \param partition_pos The position to partition tiles to two parts
+   * \param innerpart_factor The factor of the second part
+   * \param decision The sampling decision
+   * \return A list of length `n`, the random partitioned tile sizes sampled
+   */
+  virtual Array<ExprRV> SamplePartitionedTile(const LoopRV& loop_rv, int n, int partition_pos,
+                                              int innerpart_factor,
+                                              Optional<Array<Integer>> decision = NullOpt) = 0;
   /*!
    * \brief Sample a compute-at location of the given block
    * \param block_rv The block whose compute-at location is to be sampled
@@ -291,7 +312,26 @@ class ScheduleNode : public runtime::Object {
    * block
    */
   virtual Array<BlockRV> GetConsumers(const BlockRV& block_rv) = 0;
+  /*!
+   * \brief Get the list of output blocks within the given scope
+   * An output block is a block which has atleast one buffer being written
+   * to, but is not allocated within the PrimFunc
+   * \param scope_block_rv The scope block from which output blocks are collected
+   * \return A list of all blocks that write to some output buffer
+   * block
+   */
+  virtual Array<BlockRV> GetOutputBlocks(const BlockRV& scope_block_rv) = 0;
   /******** Schedule: Transform loops ********/
+  /*!
+   * \brief Merge a list of loops into one. The loops under their LCA requires:
+   * 1) Under the same scope
+   * 2) Can't have annotations or thread bindings
+   * 3) Start with 0 and have same extent and same nesting depth
+   * 4) From target loop to their LCA, the inner loop must be the only child of the outer loop
+   * \param loop_rvs The loops to be merged
+   * \return The new loop after merge
+   */
+  virtual LoopRV Merge(const Array<LoopRV>& loop_rvs) = 0;
   /*!
    * \brief Fuse a list of consecutive loops into one. It requires:
    * 1) The loops can't have annotations or thread bindings.
@@ -310,11 +350,27 @@ class ScheduleNode : public runtime::Object {
    * \param loop_rv The loop to be split
    * \param factors The positive tiling factors, and at most one of which is `NullOpt`, which means
    * that factor is inferred.
-   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings
-   * \return The new loops after split
+   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings.
+   * \param disable_predication If enabled, don't create a predicate for guarding the
+   * loop. This can be useful when splitting with scalable factors that the schedule writer
+   * knows are divisible by the loop bound.
+   * Warning: enabling this feature may result in incorrect code generation if not used carefully.
+   * \return The new loops after split.
    */
   virtual Array<LoopRV> Split(const LoopRV& loop_rv, const Array<Optional<ExprRV>>& factors,
-                              bool preserve_unit_iters = true) = 0;
+                              bool preserve_unit_iters = true,
+                              bool disable_predication = false) = 0;
+  /*!
+   * \brief Partition the loops into sequence of multiple loops
+   * 1) The loop can't have annotation or thread binding.
+   * \param loop_rv The loop to be partition
+   * \param factors The positive integers, and at most one of which is `NullOpt`, which means
+   * that factor is inferred.
+   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings
+   * \return The new loops after partition
+   */
+  virtual Array<LoopRV> LoopPartition(const LoopRV& loop_rv, const Array<Optional<ExprRV>>& factors,
+                                      bool preserve_unit_iters = true) = 0;
   /*!
    * \brief Reorder a list of loops. It doesn't require the loops to be consecutive.
    * It requires:
@@ -328,6 +384,12 @@ class ScheduleNode : public runtime::Object {
    * \param ordered_loop_rvs The loops in the new order
    */
   virtual void Reorder(const Array<LoopRV>& ordered_loop_rvs) = 0;
+  /*!
+   * \brief Reorder the itervars inside a block.
+   * \param block_rv The block to be transformed.
+   * \param new_order The new itervar order.
+   */
+  virtual void ReorderBlockIterVar(const BlockRV& block_rv, const Array<Integer> new_order) = 0;
   /*!
    * \brief Create a new unit loop on top of the specific block.
    * \param block_rv The block above which the new loop is created
@@ -399,13 +461,43 @@ class ScheduleNode : public runtime::Object {
    * \param block_rv The producer of the buffer
    * \param write_buffer_index The index of the buffer in block's write region
    * \param storage_scope The target storage scope
+   * \param consumer_blocks An optional list of consumers to read from cache directly.
    * \return The cache stage block.
    */
   virtual BlockRV CacheWrite(const BlockRV& block_rv, int write_buffer_index,
-                             const String& storage_scope) = 0;
+                             const String& storage_scope,
+                             const Array<BlockRV> consumer_blocks = {}) = 0;
+  /*!
+   * \brief Create a block that reads a buffer region into a read cache. It requires:
+   * 1) There is at most one block who writes the buffer in the scope.
+   * 2) The scope block have stage-pipeline property.
+   * Compared to cache read, the indices to access allocated cache buffer is customized by user.
+   * \param block_rv The consumer block of the target buffer.
+   * \param read_buffer_index The index of the buffer in block's read region.
+   * \param storage_scope The target storage scope.
+   * \param index_map User defined indices to access allocated cache buffer, maps from block iter
+   * vars.
+   * \return The cache stage block.
+   */
+  virtual BlockRV ReindexCacheRead(const BlockRV& block_rv, int read_buffer_index,
+                                   const String& storage_scope, const IndexMap& index_map) = 0;
+  /*!
+   * \brief Create a block that writes a buffer region into a write cache. It requires:
+   * 1) There is only one block who writes the target buffer.
+   * 2) The scope block have stage-pipeline property.
+   * Compared to cache write, the indices to access allocated cache buffer is customized by user.
+   * \param block_rv The producer of the buffer
+   * \param write_buffer_index The index of the buffer in block's write region
+   * \param storage_scope The target storage scope
+   * \param index_map User defined indices to access allocated cache buffer, maps from block iter
+   * vars.
+   * \return The cache stage block.
+   */
+  virtual BlockRV ReindexCacheWrite(const BlockRV& block_rv, int write_buffer_index,
+                                    const String& storage_scope, const IndexMap& index_map) = 0;
   /*!
    * \brief Create 2 blocks that read&write a buffer region into a read/write cache.
-   * It requires the the target block both read & write the target buffer.
+   * It requires the target block both read & write the target buffer.
    * \param block_rv The target block operates on the target buffer.
    * \param read_buffer_index The index of the buffer in block's read region.
    * \param storage_scope The target storage scope
@@ -413,6 +505,16 @@ class ScheduleNode : public runtime::Object {
    */
   virtual Array<BlockRV> CacheInplace(const BlockRV& block_rv, int read_buffer_index,
                                       const String& storage_scope) = 0;
+  /*!
+   * \brief Create a block to cache precomputed index for later use.
+   * if there is no index computation, keep unchanged.
+   * \param block_rv The target block
+   * \param storage_scope The storage scope of cached block
+   * \param cse_thresh The repeat threshold that determines a common sub expr
+   * \return The cache stage blocks.
+   */
+  virtual Array<BlockRV> CacheIndex(const BlockRV& block_rv, const String& storage_scope,
+                                    int cse_thresh) = 0;
   /*!
    * \brief Create a block that read/write a buffer region into a read/write cache with reindexing.
    * The layout of the cache will be the same as by the iterators of the block that reads/writes the
@@ -426,6 +528,11 @@ class ScheduleNode : public runtime::Object {
    */
   virtual BlockRV ReIndex(const BlockRV& block_rv, int buffer_index,
                           BufferIndexType buffer_index_type) = 0;
+  /******** Schedule: Data movement ********/
+  virtual BlockRV ReadAt(const LoopRV& loop_rv, const BlockRV& block_rv, int read_buffer_index,
+                         const String& storage_scope) = 0;
+  virtual BlockRV WriteAt(const LoopRV& loop_rv, const BlockRV& block_rv, int write_buffer_index,
+                          const String& storage_scope) = 0;
   /******** Schedule: Compute location ********/
   /*!
    * \brief Move a producer block under the specific loop, and regenerate the
@@ -544,32 +651,54 @@ class ScheduleNode : public runtime::Object {
   virtual void StorageAlign(const BlockRV& block_rv, int buffer_index, int axis, int factor,
                             int offset) = 0;
   /*!
-   * \brief Set the storage scope of a buffer, where the buffer is specified by the a block and a
+   * \brief Set the storage scope of a buffer, where the buffer is specified by a block and a
    * write-index
    * \param block_rv The producer block of the buffer
    * \param buffer_index The index of the buffer in block's write region
    * \param storage_scope The storage scope to be set
    */
   virtual void SetScope(const BlockRV& block_rv, int buffer_index, const String& storage_scope) = 0;
+  /*!
+   * \brief Set the data type of a buffer, where the buffer is specified by a block and a
+   * write-index
+   * \note This schedule primitive is unsafe and may change correctness of program because of
+   *   type conversion, please use with caution.
+   * \param block_rv The producer block of the buffer
+   * \param buffer_index the index of the buffer in block's write region
+   * \param dtype The data type to be set
+   */
+  virtual void UnsafeSetDType(const BlockRV& block_rv, int buffer_index, const String& dtype) = 0;
   /******** Schedule: Blockize & Tensorize ********/
   /*!
    * \brief Convert the subtree rooted at a specific loop into a block.
    * \param loop_rv the root of the subtree
+   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings
    * \return the new block
    */
-  virtual BlockRV Blockize(const LoopRV& loop_rv) = 0;
+  virtual BlockRV Blockize(const LoopRV& loop_rv, bool preserve_unit_iters = true) = 0;
+  /*!
+   * \brief Convert specified blocks into a nested block.
+   * \param blocks the specified block to construct the new block
+   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings
+   * \return the new block
+   */
+  virtual BlockRV Blockize(const Array<BlockRV>& blocks, bool preserve_unit_iters = true) = 0;
   /*!
    * \brief Tensorize the computation enclosed by loop with the tensor intrin.
    * \param loop_rv The loop to be tensorized
    * \param intrin Name of the tensor intrinsic
+   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings
    */
-  virtual void Tensorize(const LoopRV& loop_rv, const String& intrin) = 0;
+  virtual void Tensorize(const LoopRV& loop_rv, const String& intrin,
+                         bool preserve_unit_iters = true) = 0;
   /*!
    * \brief Tensorize the computation enclosed by loop with the tensor intrin.
    * \param block_rv The block to be tensorized
    * \param intrin Name of the tensor intrinsic
+   * \param preserve_unit_iters Whether or not to preserve unit iterators in block bindings
    */
-  virtual void Tensorize(const BlockRV& block_rv, const String& intrin) = 0;
+  virtual void Tensorize(const BlockRV& block_rv, const String& intrin,
+                         bool preserve_unit_iters = true) = 0;
 
   /******** Schedule: Annotation ********/
   /*!
@@ -625,10 +754,17 @@ class ScheduleNode : public runtime::Object {
    *    Algebraic symplifications, branch elimination, and other
    *    optimizations may assume that this precondition is met, and
    *    may result in incorrect results being returned.
+   *
+   * \param assume_injective_transform If set to true, the schedule primitive will assume the
+   * index_map is injective and skip checking overlapping of the mapped indices. This can be useful
+   * for complicated index_map that the analysis does not cover. It is the callers' responsibility
+   * to ensure the index map is injective, otherwise, the correctness of the schedule is not
+   * guaranteed.
    */
   virtual void TransformLayout(const BlockRV& block_rv, int buffer_index,
                                BufferIndexType buffer_index_type, const IndexMap& index_map,
-                               const Optional<IndexMap>& pad_value = NullOpt) = 0;
+                               const Optional<IndexMap>& pad_value = NullOpt,
+                               bool assume_injective_transform = false) = 0;
 
   /*!
    * \brief Apply a transformation represented by IndexMap to block
@@ -681,9 +817,46 @@ class ScheduleNode : public runtime::Object {
    */
   virtual void PadEinsum(const BlockRV& block_rv, const Array<Integer>& padding) = 0;
 
+  /******** Schedule: Buffer transformation ********/
+  /*!
+   * \brief Compute the target buffer via rolling buffering.
+   * \details This primitive selects the outermost rollable axis with a positive bound overlap that
+   * appears in the block's ancestor loops as `rolling axis`, fold and circularize the buffer along
+   * the rolling dimension, append block predicate to avoid recomputing overlapping elements.
+   * It requires:
+   * 1) The buffer to be an intermediate buffer defined via `alloc_buffer`.
+   * 2) The LCA of the producer and consumer of the buffer is a for loop, typically,
+   *    the producer and consumer of the buffer are cascaded through compute_at.
+   * 3) The access region of the buffer has at least one dimension that contains
+   *    a positive bound overlap.
+   * \param block_rv The producer block of the buffer.
+   * \param write_buffer_index The index of the buffer in block's write region.
+   */
+  virtual void RollingBuffer(const BlockRV& block_rv, int write_buffer_index) = 0;
+
+  /*!
+   * \brief Annotate the buffer access of a block
+   * \param block_rv The block to be annotated
+   * \param buffer_index The index of the buffer in block's read or write region
+   * \param buffer_index_type The type of the buffer index, kRead or kWrite.
+   * \param index_map The index map that defines the new read or write region
+   */
+  virtual void AnnotateBufferAccess(const BlockRV& block_rv, int buffer_index,
+                                    BufferIndexType buffer_index_type,
+                                    const IndexMap& index_map) = 0;
+
   /******** Schedule: Misc ********/
   /*! \brief A no-op that marks the start of postprocessing phase of scheduling */
   virtual void EnterPostproc() = 0;
+
+  /*!
+   * \brief Hide some buffer access in the given block.
+   * \param block_rv The block where we hide buffer access.
+   * \param buf_type The buffer type: read/write
+   * \param buf_index_array The array of buffer indices we hide access.
+   */
+  virtual void UnsafeHideBufferAccess(const BlockRV& block_rv, const String& buf_type,
+                                      const Array<IntImm>& buf_index_array) = 0;
 };
 
 /*!
@@ -710,14 +883,15 @@ class Schedule : public runtime::ObjectRef {
    * \param debug_mask Do extra correctness checking after the class creation
    * and each time after calling the Replace method.
    * \param error_render_level The level of error rendering
+   * \param enable_check Whether to enable some prequisite checks for schedule primitives, it's
+   *   user's duty to guarantee the schedule correctness if we disable the checks.
    * \return The concrete schedule created
    * \sa ScheduleDebugMask
-   * \note The checks performed includes:
-   * 1) VerifySRefTree
-   * 2) VerifyCachedFlags
+   * \note The checks performed includes: 1) VerifySRefTree 2) VerifyCachedFlags
    */
   TVM_DLL static Schedule Concrete(IRModule mod, support::LinearCongruentialEngine::TRandState seed,
-                                   int debug_mask, ScheduleErrorRenderLevel error_render_level);
+                                   int debug_mask, ScheduleErrorRenderLevel error_render_level,
+                                   bool enable_check = true);
   /*!
    * \brief Construct a traced concrete TensorIR schedule from an IRModule
    * \param mod The IRModule to be scheduled
@@ -725,6 +899,7 @@ class Schedule : public runtime::ObjectRef {
    * \param debug_mask Do extra correctness checking after the class creation
    * and each time after calling the Replace method.
    * \param error_render_level The level of error rendering
+   * \param enable_check Whether to enable prequisite checks for schedule primitives.
    * \return The concrete schedule created
    * \sa ScheduleDebugMask
    * \note The checks performed include:
@@ -732,7 +907,8 @@ class Schedule : public runtime::ObjectRef {
    * 2) VerifyCachedFlags
    */
   TVM_DLL static Schedule Traced(IRModule mod, support::LinearCongruentialEngine::TRandState seed,
-                                 int debug_mask, ScheduleErrorRenderLevel error_render_level);
+                                 int debug_mask, ScheduleErrorRenderLevel error_render_level,
+                                 bool enable_check = true);
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(Schedule, runtime::ObjectRef, ScheduleNode);
 };
 

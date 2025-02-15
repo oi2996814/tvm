@@ -62,24 +62,6 @@ class PatternMatcher : public ExprVisitor {
     }
   }
 
-  void VisitExpr_(const LoadNode* op) final {
-    const auto* ptr = expr_to_match_.as<LoadNode>();
-    if (ptr == nullptr) {
-      match_success_ = false;
-    } else {
-      if (!op->buffer_var.same_as(ptr->buffer_var)) {
-        match_success_ = false;
-      } else {
-        PrimExpr tmp = expr_to_match_;
-        expr_to_match_ = ptr->predicate;
-        VisitExpr(op->predicate);
-        expr_to_match_ = ptr->index;
-        VisitExpr(op->index);
-        std::swap(expr_to_match_, tmp);
-      }
-    }
-  }
-
   void VisitExpr_(const LetNode* op) final {
     const auto* ptr = expr_to_match_.as<LetNode>();
     if (ptr == nullptr) {
@@ -196,16 +178,14 @@ class PatternMatcher : public ExprVisitor {
     if (ptr == nullptr) {
       match_success_ = false;
     } else {
-      if (op->lanes != ptr->lanes) {
-        match_success_ = false;
-      } else {
-        PrimExpr tmp = expr_to_match_;
-        expr_to_match_ = ptr->base;
-        VisitExpr(op->base);
-        expr_to_match_ = ptr->stride;
-        VisitExpr(op->stride);
-        std::swap(expr_to_match_, tmp);
-      }
+      PrimExpr tmp = expr_to_match_;
+      expr_to_match_ = ptr->base;
+      VisitExpr(op->base);
+      expr_to_match_ = ptr->stride;
+      VisitExpr(op->stride);
+      expr_to_match_ = ptr->lanes;
+      VisitExpr(op->lanes);
+      std::swap(expr_to_match_, tmp);
     }
   }
 
@@ -214,14 +194,12 @@ class PatternMatcher : public ExprVisitor {
     if (ptr == nullptr) {
       match_success_ = false;
     } else {
-      if (op->lanes != ptr->lanes) {
-        match_success_ = false;
-      } else {
-        PrimExpr tmp = expr_to_match_;
-        expr_to_match_ = ptr->value;
-        VisitExpr(op->value);
-        std::swap(expr_to_match_, tmp);
-      }
+      PrimExpr tmp = expr_to_match_;
+      expr_to_match_ = ptr->value;
+      VisitExpr(op->value);
+      expr_to_match_ = ptr->lanes;
+      VisitExpr(op->lanes);
+      std::swap(expr_to_match_, tmp);
     }
   }
 
@@ -412,16 +390,15 @@ void ExtractReductionUpdates(const Optional<ScheduleState>& self, Block block,
   if (p_seq == nullptr && p_buf_store == nullptr) {
     ErrorRFactorCrossThreadReductionNotApplicable(self, std::move(block), /*violated_cond=*/5);
   }
-  SeqStmt seq =
-      p_seq != nullptr ? GetRef<SeqStmt>(p_seq) : SeqStmt({GetRef<BufferStore>(p_buf_store)});
-  if (static_cast<int>(seq->seq.size()) != n_buffers) {
+  Array<Stmt> seq = p_seq != nullptr ? p_seq->seq : Array<Stmt>{GetRef<BufferStore>(p_buf_store)};
+  if (static_cast<int>(seq.size()) != n_buffers) {
     ErrorRFactorCrossThreadReductionNotApplicable(self, std::move(block), /*violated_cond=*/6);
   }
 
   // Step 2.
   // - Create BufferStores according to the variables being stored.
   // - Construct the mapping from reduction buffers to the index.
-  for (const Stmt& stmt : seq->seq) {
+  for (const Stmt& stmt : seq) {
     const auto* buf_store = stmt.as<BufferStoreNode>();
     if (buf_store == nullptr) {
       ErrorRFactorCrossThreadReductionNotApplicable(self, std::move(block), /*violated_cond=*/5);
@@ -455,20 +432,20 @@ std::pair<Array<PrimExpr>, Array<BufferStore>> GetInitValuesAndUpdatesFromReduct
   Array<BufferStore> updates;
 
   // Step 1. Extract the BufferStores serving as block inits.
-  if (const auto* init = block->init.as<BufferStoreNode>()) {
-    inits.push_back(GetRef<BufferStore>(init));
+  if (auto init = block->init.as<BufferStore>()) {
+    inits.push_back(init.value());
   } else if (const auto* seq_init = block->init.as<SeqStmtNode>()) {
     std::unordered_set<const BufferNode*> init_buffers;
     for (const Stmt& stmt : seq_init->seq) {
-      init = stmt.as<BufferStoreNode>();
-      if (init == nullptr) {
+      auto init = stmt.as<BufferStore>();
+      if (!init) {
         ErrorRFactorCrossThreadReductionNotApplicable(self, std::move(block), /*violated_cond=*/1);
       }
-      auto insert_result = init_buffers.insert(init->buffer.get());
+      auto insert_result = init_buffers.insert(init.value()->buffer.get());
       if (!insert_result.second) {
         ErrorRFactorCrossThreadReductionNotApplicable(self, std::move(block), /*violated_cond=*/2);
       }
-      inits.push_back(GetRef<BufferStore>(init));
+      inits.push_back(init.value());
     }
   } else {
     ErrorRFactorCrossThreadReductionNotApplicable(self, std::move(block), /*violated_cond=*/1);
@@ -558,23 +535,47 @@ bool ReductionIterNotIndexOutputBuffer(const Block& block) {
   for (const BufferRegion& write_region : block->writes) {
     buffer_written.insert(write_region->buffer.get());
   }
+
+  std::unordered_set<const BufferNode*> buffer_allocated;
+  buffer_allocated.reserve(block->alloc_buffers.size());
+  for (const Buffer& buffer : block->alloc_buffers) {
+    buffer_allocated.insert(buffer.get());
+  }
+
   auto f_uses_reduction_block_var = [&](const PrimExpr& expr) -> bool {
     return UsesVar(expr, [&](const VarNode* var) {  //
       return reduction_block_iters.count(var);
     });
   };
+
+  std::unordered_map<const BufferNode*, const BufferNode*> match_buffer_sources;
+  for (const MatchBufferRegion& region : block->match_buffers) {
+    match_buffer_sources[region->buffer.get()] = region->source->buffer.get();
+  }
   bool affected = false;
   PreOrderVisit(block->body, [&](const ObjectRef& obj) {
     if (affected) {
       return false;
     }
+    const auto* block_node = obj.as<BlockNode>();
+    if (block_node) {
+      for (const MatchBufferRegion& region : block_node->match_buffers) {
+        match_buffer_sources[region->buffer.get()] = region->source->buffer.get();
+      }
+    }
     const auto* store = obj.as<BufferStoreNode>();
     if (!store) {
       return true;
     }
-    ICHECK(buffer_written.count(store->buffer.get()))
+
+    bool write_is_covered_by_match_buffer =
+        match_buffer_sources.count(store->buffer.get()) &&
+        buffer_written.count(match_buffer_sources.find(store->buffer.get())->second);
+    ICHECK(buffer_written.count(store->buffer.get()) || write_is_covered_by_match_buffer ||
+           buffer_allocated.count(store->buffer.get()))
         << "ValueError: The buffer \"" << store->buffer
-        << "\" is written in the block but is not in the block's signature";
+        << "\" is written in the block but is not in the block's signature nor is it covered by "
+           "a match_buffer";
     for (const PrimExpr& index : store->indices) {
       if (f_uses_reduction_block_var(index)) {
         affected = true;

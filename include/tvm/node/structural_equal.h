@@ -28,6 +28,7 @@
 #include <tvm/runtime/container/array.h>
 #include <tvm/runtime/data_type.h>
 
+#include <cmath>
 #include <string>
 
 namespace tvm {
@@ -38,11 +39,21 @@ namespace tvm {
 class BaseValueEqual {
  public:
   bool operator()(const double& lhs, const double& rhs) const {
-    // fuzzy float pt comparison
-    constexpr double atol = 1e-9;
-    if (lhs == rhs) return true;
-    double diff = lhs - rhs;
-    return diff > -atol && diff < atol;
+    if (std::isnan(lhs) && std::isnan(rhs)) {
+      // IEEE floats do not compare as equivalent to each other.
+      // However, for the purpose of comparing IR representation, two
+      // NaN values are equivalent.
+      return true;
+    } else if (std::isnan(lhs) || std::isnan(rhs)) {
+      return false;
+    } else if (lhs == rhs) {
+      return true;
+    } else {
+      // fuzzy float pt comparison
+      constexpr double atol = 1e-9;
+      double diff = lhs - rhs;
+      return diff > -atol && diff < atol;
+    }
   }
 
   bool operator()(const int64_t& lhs, const int64_t& rhs) const { return lhs == rhs; }
@@ -108,9 +119,11 @@ class StructuralEqual : public BaseValueEqual {
    * \brief Compare objects via strutural equal.
    * \param lhs The left operand.
    * \param rhs The right operand.
+   * \param map_free_params Whether or not to map free variables.
    * \return The comparison result.
    */
-  TVM_DLL bool operator()(const ObjectRef& lhs, const ObjectRef& rhs) const;
+  TVM_DLL bool operator()(const ObjectRef& lhs, const ObjectRef& rhs,
+                          const bool map_free_params = false) const;
 };
 
 /*!
@@ -154,6 +167,13 @@ class SEqualReducer {
     virtual void DeferFail(const ObjectPathPair& mismatch_paths) = 0;
 
     /*!
+     * \brief Check if fail defferal is enabled.
+     *
+     * \return false if the fail deferral is not enabled, true otherwise.
+     */
+    virtual bool IsFailDeferralEnabled() = 0;
+
+    /*!
      * \brief Lookup the graph node equal map for vars that are already mapped.
      *
      *  This is an auxiliary method to check the Map<Var, Value> equality.
@@ -184,24 +204,53 @@ class SEqualReducer {
 
   /*!
    * \brief Reduce condition to comparison of two attribute values.
+   *
    * \param lhs The left operand.
+   *
    * \param rhs The right operand.
+   *
+   * \param paths The paths to the LHS and RHS operands.  If
+   * unspecified, will attempt to identify the attribute's address
+   * within the most recent ObjectRef.  In general, the paths only
+   * require explicit handling for computed parameters
+   * (e.g. `array.size()`)
+   *
    * \return the immediate check result.
    */
-  bool operator()(const double& lhs, const double& rhs) const;
-  bool operator()(const int64_t& lhs, const int64_t& rhs) const;
-  bool operator()(const uint64_t& lhs, const uint64_t& rhs) const;
-  bool operator()(const int& lhs, const int& rhs) const;
-  bool operator()(const bool& lhs, const bool& rhs) const;
-  bool operator()(const std::string& lhs, const std::string& rhs) const;
-  bool operator()(const DataType& lhs, const DataType& rhs) const;
+  bool operator()(const double& lhs, const double& rhs,
+                  Optional<ObjectPathPair> paths = NullOpt) const;
+  bool operator()(const int64_t& lhs, const int64_t& rhs,
+                  Optional<ObjectPathPair> paths = NullOpt) const;
+  bool operator()(const uint64_t& lhs, const uint64_t& rhs,
+                  Optional<ObjectPathPair> paths = NullOpt) const;
+  bool operator()(const int& lhs, const int& rhs, Optional<ObjectPathPair> paths = NullOpt) const;
+  bool operator()(const bool& lhs, const bool& rhs, Optional<ObjectPathPair> paths = NullOpt) const;
+  bool operator()(const std::string& lhs, const std::string& rhs,
+                  Optional<ObjectPathPair> paths = NullOpt) const;
+  bool operator()(const DataType& lhs, const DataType& rhs,
+                  Optional<ObjectPathPair> paths = NullOpt) const;
 
   template <typename ENum, typename = typename std::enable_if<std::is_enum<ENum>::value>::type>
-  bool operator()(const ENum& lhs, const ENum& rhs) const {
+  bool operator()(const ENum& lhs, const ENum& rhs,
+                  Optional<ObjectPathPair> paths = NullOpt) const {
     using Underlying = typename std::underlying_type<ENum>::type;
     static_assert(std::is_same<Underlying, int>::value,
                   "Enum must have `int` as the underlying type");
-    return EnumAttrsEqual(static_cast<int>(lhs), static_cast<int>(rhs), &lhs, &rhs);
+    return EnumAttrsEqual(static_cast<int>(lhs), static_cast<int>(rhs), &lhs, &rhs, paths);
+  }
+
+  template <typename T, typename Callable,
+            typename = std::enable_if_t<
+                std::is_same_v<std::invoke_result_t<Callable, const ObjectPath&>, ObjectPath>>>
+  bool operator()(const T& lhs, const T& rhs, const Callable& callable) {
+    if (IsPathTracingEnabled()) {
+      ObjectPathPair current_paths = GetCurrentObjectPaths();
+      ObjectPathPair new_paths = {callable(current_paths->lhs_path),
+                                  callable(current_paths->rhs_path)};
+      return (*this)(lhs, rhs, new_paths);
+    } else {
+      return (*this)(lhs, rhs);
+    }
   }
 
   /*!
@@ -303,7 +352,8 @@ class SEqualReducer {
   void RecordMismatchPaths(const ObjectPathPair& paths) const;
 
  private:
-  bool EnumAttrsEqual(int lhs, int rhs, const void* lhs_address, const void* rhs_address) const;
+  bool EnumAttrsEqual(int lhs, int rhs, const void* lhs_address, const void* rhs_address,
+                      Optional<ObjectPathPair> paths = NullOpt) const;
 
   bool ObjectAttrsEqual(const ObjectRef& lhs, const ObjectRef& rhs, bool map_free_vars,
                         const ObjectPathPair* paths) const;
@@ -314,7 +364,8 @@ class SEqualReducer {
 
   template <typename T>
   static bool CompareAttributeValues(const T& lhs, const T& rhs,
-                                     const PathTracingData* tracing_data);
+                                     const PathTracingData* tracing_data,
+                                     Optional<ObjectPathPair> paths = NullOpt);
 
   /*! \brief Internal class pointer. */
   Handler* handler_ = nullptr;
@@ -331,12 +382,14 @@ class SEqualReducer {
  */
 class SEqualHandlerDefault : public SEqualReducer::Handler {
  public:
-  SEqualHandlerDefault(bool assert_mode, Optional<ObjectPathPair>* first_mismatch);
+  SEqualHandlerDefault(bool assert_mode, Optional<ObjectPathPair>* first_mismatch,
+                       bool defer_fails);
   virtual ~SEqualHandlerDefault();
 
   bool SEqualReduce(const ObjectRef& lhs, const ObjectRef& rhs, bool map_free_vars,
                     const Optional<ObjectPathPair>& current_paths) override;
   void DeferFail(const ObjectPathPair& mismatch_paths) override;
+  bool IsFailDeferralEnabled() override;
   ObjectRef MapLhsToRhs(const ObjectRef& lhs) override;
   void MarkGraphNode() override;
 

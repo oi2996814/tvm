@@ -21,6 +21,8 @@
  * \file schedule_lang.cc
  */
 #include <dmlc/thread_local.h>
+#include <tvm/arith/analyzer.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/te/operation.h>
 #include <tvm/te/schedule.h>
@@ -68,7 +70,7 @@ DataType MatchDataType(std::vector<DataType> dtypes) {
 }
 
 void SplitHelper(StageNode* self, IterVar parent, PrimExpr factor, PrimExpr nparts,
-                 IterVar* p_outer, IterVar* p_inner) {
+                 IterVar* p_outer, IterVar* p_inner, bool disable_predication) {
   // Check if split is valid.
   ICHECK(parent->iter_type == kDataPar || parent->iter_type == kCommReduce ||
          parent->iter_type == kOrdered)
@@ -81,7 +83,7 @@ void SplitHelper(StageNode* self, IterVar parent, PrimExpr factor, PrimExpr npar
   Array<IterVar>& all_vars = self->all_iter_vars;
   Array<IterVar>& leaf_vars = self->leaf_iter_vars;
   size_t pos = FindLeafVar(all_vars.GetArrayNode(), leaf_vars.GetArrayNode(), parent);
-  self->relations.push_back(Split(parent, outer, inner, factor, nparts));
+  self->relations.push_back(Split(parent, outer, inner, factor, nparts, disable_predication));
   // add vars to all vars
   all_vars.push_back(outer);
   all_vars.push_back(inner);
@@ -91,7 +93,7 @@ void SplitHelper(StageNode* self, IterVar parent, PrimExpr factor, PrimExpr npar
   leaf_vars.insert(leaf_vars.begin() + pos, outer);
 }
 
-Stage::Stage(Operation op) {
+Stage::Stage(Operation op, const ScheduleNode* sch) {
   auto n = make_object<StageNode>();
   n->op = op;
   n->origin_op = op;
@@ -106,6 +108,7 @@ Stage::Stage(Operation op) {
   } else {
     n->leaf_iter_vars = clean;
   }
+  n->attach_sch = sch;
   data_ = std::move(n);
 }
 
@@ -124,11 +127,13 @@ Stage Stage::GetAttachSpec() const {
 }
 
 Stage& Stage::set_scope(std::string scope) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   (*this)->scope = scope;
   return *this;
 }
 
 Stage& Stage::compute_at(Stage parent, IterVar scope) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   ICHECK_NE((*this)->attach_type, kScanUpdate) << "Cannot specify compute_at for scan updates";
   // Group constraint checking.
   Stage group = (*this)->group;
@@ -156,18 +161,21 @@ Stage& Stage::compute_at(Stage parent, IterVar scope) {  // NOLINT(*)
 }
 
 Stage& Stage::compute_inline() {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   ICHECK_NE((*this)->attach_type, kScanUpdate) << "Cannot specify compute_at for scan updates";
   (*this)->attach_type = kInline;
   return *this;
 }
 
 Stage& Stage::compute_root() {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   ICHECK_NE((*this)->attach_type, kScanUpdate) << "Cannot specify compute_at for scan updates";
   (*this)->attach_type = kGroupRoot;
   return *this;
 }
 
 Stage& Stage::bind(IterVar ivar, IterVar thread_ivar) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   ICHECK(ivar->iter_type == kDataPar || ivar->iter_type == kCommReduce)
       << "Cannot bind " << IterVarType2String(ivar->iter_type) << " to thread";
@@ -194,6 +202,7 @@ Stage& Stage::bind(IterVar ivar, IterVar thread_ivar) {  // NOLINT(*)
 }
 
 Stage& Stage::env_threads(Array<IterVar> threads) {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   ICHECK(self->op.defined() && self->op.as<ScanOpNode>())
       << "env_threads is only valid for composite ops such as ScanOp";
@@ -211,24 +220,28 @@ Stage& Stage::env_threads(Array<IterVar> threads) {
 }
 
 Stage& Stage::set_store_predicate(PrimExpr predicate) {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   self->store_predicate = predicate;
   return *this;
 }
 
-Stage& Stage::split(IterVar parent, PrimExpr factor, IterVar* p_outer,
-                    IterVar* p_inner) {  // NOLINT(*)
-  SplitHelper(operator->(), parent, factor, PrimExpr(), p_outer, p_inner);
+Stage& Stage::split(IterVar parent, PrimExpr factor, IterVar* p_outer, IterVar* p_inner,
+                    bool disable_predication) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
+  SplitHelper(operator->(), parent, factor, PrimExpr(), p_outer, p_inner, disable_predication);
   return *this;
 }
 
-Stage& Stage::split_by_nparts(IterVar parent, PrimExpr nparts, IterVar* p_outer,
-                              IterVar* p_inner) {  // NOLINT(*)
-  SplitHelper(operator->(), parent, PrimExpr(), nparts, p_outer, p_inner);
+Stage& Stage::split_by_nparts(IterVar parent, PrimExpr nparts, IterVar* p_outer, IterVar* p_inner,
+                              bool disable_predication) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
+  SplitHelper(operator->(), parent, PrimExpr(), nparts, p_outer, p_inner, disable_predication);
   return *this;
 }
 
 Stage& Stage::fuse(IterVar outer, IterVar inner, IterVar* p_target) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   ICHECK(outer->iter_type == kDataPar || outer->iter_type == kCommReduce ||
          outer->iter_type == kOrdered)
@@ -264,6 +277,7 @@ Stage& Stage::fuse(IterVar outer, IterVar inner, IterVar* p_target) {  // NOLINT
 }
 
 Stage& Stage::fuse(const Array<IterVar>& axes, IterVar* p_target) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   if (axes.size() != 0) {
     IterVar fused = axes[0];
     for (size_t i = 1; i < axes.size(); ++i) {
@@ -287,6 +301,7 @@ Stage& Stage::fuse(const Array<IterVar>& axes, IterVar* p_target) {  // NOLINT(*
 }
 
 Stage& Stage::reorder(const Array<IterVar>& order) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   std::unordered_set<IterVar> seen_var;
   StageNode* self = operator->();
   for (IterVar iv : order) {
@@ -347,6 +362,7 @@ inline void SetAttrIterType(StageNode* self, IterVar var, IterVarType iter_type)
 }
 
 Stage& Stage::vectorize(IterVar var) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   ICHECK(var->iter_type == kDataPar || var->iter_type == kOpaque || var->iter_type == kUnrolled ||
          var->iter_type == kVectorized || var->iter_type == kTensorized ||
          var->iter_type == kParallelized)
@@ -356,6 +372,7 @@ Stage& Stage::vectorize(IterVar var) {  // NOLINT(*)
 }
 
 Stage& Stage::tensorize(IterVar var, TensorIntrin f) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   UpdateIterVarAttr(operator->(), var, [f](IterVarAttrNode* n) {
     n->iter_type = kTensorized;
     n->tensor_intrin = f;
@@ -364,11 +381,13 @@ Stage& Stage::tensorize(IterVar var, TensorIntrin f) {  // NOLINT(*)
 }
 
 Stage& Stage::unroll(IterVar var) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   SetAttrIterType(operator->(), var, kUnrolled);
   return *this;
 }
 
 Stage& Stage::parallel(IterVar var) {  // NOLINT(*)
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   SetAttrIterType(operator->(), var, kParallelized);
   return *this;
 }
@@ -380,6 +399,7 @@ Stage& Stage::pragma(IterVar var, const std::string& pragma_type,
   } else if (pragma_type == "vectorize") {
     this->vectorize(var);
   } else {
+    With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
     UpdateIterVarAttr(operator->(), var, [pragma_type, pragma_value](IterVarAttrNode* n) {
       n->pragma_keys.push_back(tir::StringImm(pragma_type));
       n->pragma_values.push_back(pragma_value);
@@ -389,6 +409,7 @@ Stage& Stage::pragma(IterVar var, const std::string& pragma_type,
 }
 
 Stage& Stage::prefetch(const Tensor& tensor, IterVar var, PrimExpr offset) {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   ArrayNode* all_vars = self->all_iter_vars.CopyOnWrite();
   ArrayNode* leaf_vars = self->leaf_iter_vars.CopyOnWrite();
@@ -407,6 +428,7 @@ Stage& Stage::prefetch(const Tensor& tensor, IterVar var, PrimExpr offset) {
 }
 
 Stage& Stage::storage_align(IterVar axis, int factor, int offset) {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   UpdateIterVarAttr(
       self, axis,
@@ -419,6 +441,7 @@ Stage& Stage::storage_align(IterVar axis, int factor, int offset) {
 }
 
 Stage& Stage::double_buffer() {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   ICHECK(!self->is_output) << "Cannot apply double buffer on output";
   self->double_buffer = true;
@@ -426,6 +449,7 @@ Stage& Stage::double_buffer() {
 }
 
 Stage& Stage::rolling_buffer() {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   ICHECK(!self->is_output) << "Cannot apply rolling buffer on output";
   self->rolling_buffer = true;
@@ -434,6 +458,7 @@ Stage& Stage::rolling_buffer() {
 Stage& Stage::transform_layout(const Array<Var>& initial_indices,
                                const Array<PrimExpr>& final_indices,
                                Array<IterVar>* out_iter_vars) {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   IndexMap map(initial_indices, final_indices);
   self->layout_transforms.push_back(map);
@@ -467,10 +492,11 @@ Stage& Stage::transform_layout(const Array<Var>& initial_indices,
   for (const auto& iter_var : compute->axis) {
     initial_ranges.push_back(iter_var->dom);
   }
-  Array<Range> final_ranges = map->MapRanges(initial_ranges);
+  arith::Analyzer analyzer;
+  Array<Range> final_ranges = map->MapRanges(initial_ranges, &analyzer);
 
   // Make IterVar objects to represent the new iterations.
-  auto inverse = map.Inverse(initial_ranges);
+  auto inverse = map.Inverse(initial_ranges, &analyzer);
   Array<IterVar> final_indices_iter;
   ICHECK_EQ(inverse->initial_indices.size(), final_ranges.size());
   for (size_t i = 0; i < inverse->initial_indices.size(); i++) {
@@ -501,6 +527,7 @@ Stage& Stage::transform_layout(const Array<Var>& initial_indices,
 }
 
 Stage& Stage::set_axis_separators(const Array<IntImm>& axis_separators) {
+  With<ScheduleContext> ctx(operator->()->attach_sch, __func__);
   StageNode* self = operator->();
   self->axis_separators = axis_separators;
   return *this;
@@ -630,6 +657,7 @@ Stage Schedule::create_group(const Array<Tensor>& outputs, const Array<Tensor>& 
   }
   // Create the new group stage.
   Stage gstage(make_object<StageNode>());
+  gstage->attach_sch = this->operator->();
   gstage->group = parent_group;
   if (parent_group.defined()) {
     ++parent_group->num_child_stages;
@@ -718,6 +746,8 @@ bool ScheduleNode::Contain(const Operation& op) const {
   return stage_map.find(op) != stage_map.end();
 }
 
+TVM_REGISTER_PASS_CONFIG_OPTION("te.keep_schedule_record", Bool);
+
 Schedule::Schedule(Array<Operation> ops) {
   auto n = make_object<ScheduleNode>();
   data_ = n;
@@ -730,7 +760,7 @@ Schedule::Schedule(Array<Operation> ops) {
     output_set.insert(x);
   }
   for (Operation op : post_order) {
-    Stage stage(op);
+    Stage stage(op, this->operator->());
     stage->is_output = output_set.count(op) != 0;
     n->stages.push_back(stage);
     n->stage_map.Set(op, stage);
@@ -754,15 +784,36 @@ Schedule::Schedule(Array<Operation> ops) {
       }
     }
   }
+  transform::PassContext pass_ctx = transform::PassContext::Current();
+  n->keep_schedule_record = pass_ctx->GetConfig<Bool>("te.keep_schedule_record", Bool(false));
+  if (n->keep_schedule_record.value()) {
+    // push plain schedule as the very first one
+    n->schedule_record.push_back(copy());
+    n->primitive_record.push_back("vanilla");
+  }
 }
 
-Split::Split(IterVar parent, IterVar outer, IterVar inner, PrimExpr factor, PrimExpr nparts) {
+ScheduleContext::ScheduleContext(const ScheduleNode* sch_node, String current_primitive_name)
+    : sch_(GetRef<Schedule>(sch_node)), current_primitive_name_(current_primitive_name) {}
+
+void ScheduleContext::EnterWithScope() {}
+
+void ScheduleContext::ExitWithScope() {
+  if (sch_.defined() && sch_->keep_schedule_record.value()) {
+    sch_->schedule_record.push_back(sch_.copy());
+    sch_->primitive_record.push_back(current_primitive_name_);
+  }
+}
+
+Split::Split(IterVar parent, IterVar outer, IterVar inner, PrimExpr factor, PrimExpr nparts,
+             bool disable_predication) {
   auto n = make_object<SplitNode>();
   n->parent = parent;
   n->outer = outer;
   n->inner = inner;
   n->factor = factor;
   n->nparts = nparts;
+  n->disable_predication = disable_predication;
   data_ = std::move(n);
 }
 
@@ -878,6 +929,8 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
         p->stream << ", nparts=";
         p->Print(op->nparts);
       }
+      p->stream << ", disable_predication=";
+      p->stream << op->disable_predication;
       p->stream << ')';
     })
     .set_dispatch<FuseNode>([](const ObjectRef& node, ReprPrinter* p) {
@@ -924,16 +977,16 @@ TVM_REGISTER_GLOBAL("te.StageSetScope").set_body_method(&Stage::set_scope);
 TVM_REGISTER_GLOBAL("te.StageBind").set_body_method(&Stage::bind);
 
 TVM_REGISTER_GLOBAL("te.StageSplitByFactor")
-    .set_body_typed([](Stage stage, IterVar parent, PrimExpr factor) {
+    .set_body_typed([](Stage stage, IterVar parent, PrimExpr factor, bool disable_predication) {
       IterVar outer, inner;
-      stage.split(parent, factor, &outer, &inner);
+      stage.split(parent, factor, &outer, &inner, disable_predication);
       return Array<IterVar>({outer, inner});
     });
 
 TVM_REGISTER_GLOBAL("te.StageSplitByNParts")
-    .set_body_typed([](Stage stage, IterVar parent, PrimExpr nparts) {
+    .set_body_typed([](Stage stage, IterVar parent, PrimExpr nparts, bool disable_predication) {
       IterVar outer, inner;
-      stage.split_by_nparts(parent, nparts, &outer, &inner);
+      stage.split_by_nparts(parent, nparts, &outer, &inner, disable_predication);
       return Array<IterVar>({outer, inner});
     });
 

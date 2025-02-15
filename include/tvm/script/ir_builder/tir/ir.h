@@ -56,7 +56,7 @@ Buffer BufferDecl(Array<PrimExpr> shape, DataType dtype, String buffer_name, Opt
  * \brief The primitive function statement.
  * \return The PrimFuncFrame.
  */
-PrimFuncFrame PrimFunc();
+PrimFuncFrame PrimFunc(bool is_private);
 
 /*!
  * \brief The PrimFunc variable arguments adding function.
@@ -113,26 +113,6 @@ Buffer MatchBuffer(ObjectRef param, Array<PrimExpr> shape, DataType dtype = Data
                    PrimExpr elem_offset = PrimExpr(), String storage_scope = "global",
                    int align = -1, int offset_factor = 0, String buffer_type = "default",
                    Array<IntImm> axis_separators = {});
-
-/*!
- * \brief The pre-flattened buffer statement.
- * \param postflattened_buffer The original buffer to be flattened.
- * \param shape The type of the buffer prior to flattening.
- * \param dtype The data type in the content of the buffer.
- * \param data The pointer to the head of the data.
- * \param strides The strides of each dimension.
- * \param elem_offset The offset in terms of number of dtype elements (including lanes).
- * \param storage_scope The optional storage scope of buffer data pointer.
- * \param align The alignment requirement of data pointer in bytes.
- * \param offset_factor The factor of elem_offset field.
- * \param buffer_type The buffer type.
- * \param axis_separators The separators between input axes when generating flattened output axes.
- */
-void PreflattenedBuffer(Buffer postflattened_buffer, Array<PrimExpr> shape,
-                        DataType dtype = DataType::Float(32), Optional<Var> data = NullOpt,
-                        Array<PrimExpr> strides = {}, PrimExpr elem_offset = PrimExpr(),
-                        String storage_scope = "global", int align = -1, int offset_factor = 0,
-                        String buffer_type = "default", Array<IntImm> axis_separators = {});
 
 /*!
  * \brief The block declaration statement.
@@ -303,11 +283,15 @@ AssertFrame Assert(PrimExpr condition, String message);
 
 /*!
  * \brief The let binding.
- * \param var The variable to bind.
  * \param value The value to be bound.
+ * \param type_annotation  The type annotation of the let binding.
+ *                         Usually it is used for fine-grained var typing,
+ *                         particularly, PointerType.
+ * \param var The variable to be bound. If not specified, a new variable will be created.
  * \return The created LetFrame.
  */
-LetFrame Let(Var var, PrimExpr value);
+LetFrame LetStmt(PrimExpr value, Optional<Type> type_annotation = NullOpt,
+                 Optional<Var> var = NullOpt);
 
 /*!
  * \brief The realization.
@@ -339,9 +323,8 @@ AllocateFrame Allocate(Array<PrimExpr> extents, DataType dtype, String storage_s
  * \param annotations Additional annotation hints.
  * \return The created AllocateConstFrame.
  */
-AllocateConstFrame AllocateConst(
-    NDArray data, DataType dtype, Array<PrimExpr> extents,
-    Map<String, ObjectRef> annotations = NullValue<Map<String, ObjectRef>>());
+AllocateConstFrame AllocateConst(NDArray data, DataType dtype, Array<PrimExpr> extents,
+                                 Optional<Map<String, ObjectRef>> annotations = NullOpt);
 
 /*!
  * \brief Create an attribute.
@@ -408,19 +391,31 @@ DeclBufferFrame DeclBuffer(Array<PrimExpr> shape, DataType dtype, String buffer_
 LaunchThreadFrame LaunchThread(Var var, PrimExpr extent);
 
 /*!
+ * \brief Launch a new thread.
+ * \param thread_tag The thread type tag.
+ * \param extent The extent of environment thread.
+ * \return The result LaunchThreadFrame.
+ */
+LaunchThreadFrame LaunchThread(String thread_tag, PrimExpr extent);
+
+/*!
  * \brief Bind a var to thread env.
  * \param thread_tag The thread type tag.
+ * \param dtype The data type of the variable.
  * \return The result variable which gets bound to the thread env.
  */
-Var EnvThread(String thread_tag);
+Var EnvThread(String thread_tag, DataType dtype = DataType::Int(32));
 
 /*!
  * \brief Store data in a buffer.
  * \param buffer The buffer.
  * \param value The value to be stored.
  * \param indices The indices location to be stored.
+ * \param predicate A vector mask of boolean values indicating which lanes of a vector are to be
+ * stored. The number lanes of the mask must be equal to the number of lanes in value.
  */
-void BufferStore(Buffer buffer, PrimExpr value, Array<PrimExpr> indices);
+void BufferStore(Buffer buffer, PrimExpr value, Array<PrimExpr> indices,
+                 Optional<PrimExpr> predicate);
 
 /*!
  * \brief The prefetch hint for a buffer
@@ -436,36 +431,81 @@ void Prefetch(Buffer buffer, Array<Range> bounds);
 void Evaluate(PrimExpr value);
 
 /*!
- * \brief The pointer declaration function.
+ * \brief Create a TIR var that represents a pointer
+ *
  * \param dtype The data type of the pointer.
+ *
  * \param storage_scope The storage scope of the pointer.
+ *
+ * \param is_size_var Whether the pointer is a size var.
+ *
+ * \param is_unknown_type Used to distinguish between
+ * `PrimType(DataType::Handle())` and
+ * `PointerType(PrimType(DataType::Void()))`.  If true, resolve dtype
+ * of `Void()` as `PrimType`, and if false resolve dtype of `Void()`
+ * as a `PointerType`.
+ *
  * \return The pointer.
  */
-PrimExpr Ptr(runtime::DataType dtype, String storage_scope = "global");
+inline Var Handle(runtime::DataType dtype = runtime::DataType::Void(),
+                  String storage_scope = "global", bool is_size_var = false,
+                  bool is_unknown_type = false) {
+  Type type_annotation{nullptr};
+  if (is_unknown_type && storage_scope == "global") {
+    type_annotation = PrimType(runtime::DataType::Handle());
+  } else {
+    type_annotation = PointerType(PrimType(dtype), storage_scope);
+  }
+  return is_size_var ? tvm::tir::SizeVar("", type_annotation) : tvm::tir::Var("", type_annotation);
+}
 
-#define TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName, DType)                             \
-  inline PrimExpr FuncName(Optional<PrimExpr> expr = NullOpt) {                        \
-    DataType dtype = DType;                                                            \
-    return expr.defined() ? tvm::cast(dtype, expr.value()) : tvm::tir::Var("", dtype); \
+#define TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName, DType)                                \
+  inline PrimExpr FuncName(Optional<PrimExpr> expr = NullOpt, bool is_size_var = false) { \
+    DataType dtype = DType;                                                               \
+    return expr.defined()                                                                 \
+               ? tvm::cast(dtype, expr.value())                                           \
+               : (is_size_var ? tvm::tir::SizeVar("", dtype) : tvm::tir::Var("", dtype)); \
   }
 
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int8, DataType::Int(8));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int16, DataType::Int(16));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int32, DataType::Int(32));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int64, DataType::Int(64));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(UInt8, DataType::UInt(8));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(UInt16, DataType::UInt(16));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(UInt32, DataType::UInt(32));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(UInt64, DataType::UInt(64));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Float8, DataType::Float(8));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Float16, DataType::Float(16));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Float32, DataType::Float(32));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Float64, DataType::Float(64));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int32x4, DataType::Int(32, 4));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int32x8, DataType::Int(32, 8));
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Int32x16, DataType::Int(32, 16));
+#define TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES(DType, FDType) \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##8, FDType(8));      \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##16, FDType(16));    \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##32, FDType(32));    \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##64, FDType(64));
+
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES(Float, DataType::Float);
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES(UInt, DataType::UInt);
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES(Int, DataType::Int);
+
+#define TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES(FuncName, FDType, Size) \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName##x4, FDType(Size, 4));     \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName##x8, FDType(Size, 8));     \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName##x16, FDType(Size, 16));   \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName##x32, FDType(Size, 32));   \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(FuncName##x64, FDType(Size, 64));
+
+#define TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES_LANES(DType, FDType) \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES(DType##8, FDType, 8);      \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES(DType##16, FDType, 16);    \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES(DType##32, FDType, 32);    \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES(DType##64, FDType, 64);
+
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES_LANES(Float, DataType::Float);
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES_LANES(UInt, DataType::UInt);
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_SIZES_LANES(Int, DataType::Int);
+
+#define TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES_FIXED_SIZE(DType, FDType) \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType, FDType(1));                    \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##x4, FDType(4));                \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##x8, FDType(8));                \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##x16, FDType(16));              \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##x32, FDType(32));              \
+  TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(DType##x64, FDType(64));
+
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES_FIXED_SIZE(E4M3Float8, DataType::NVFloat8E4M3);
+TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST_LANES_FIXED_SIZE(E5M2Float8, DataType::NVFloat8E5M2);
+
 TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Boolean, DataType::Bool());
-TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Handle, DataType::Handle());
 TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST(Void, DataType::Void());
 
 #undef TVM_TIR_IR_BUILDER_DEF_DTYPE_CAST

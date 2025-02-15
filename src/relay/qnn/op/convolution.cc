@@ -53,8 +53,9 @@ bool QnnConv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   ICHECK(data->dtype == DataType::Int(8) || data->dtype == DataType::UInt(8) ||
          data->dtype == DataType::Int(16))
       << "Expected qnn conv2d type(int8, uint8, int16) for input but was " << data->dtype;
-  ICHECK(weight->dtype == DataType::Int(8) || weight->dtype == DataType::UInt(8))
-      << "Expected qnn conv2d type(int8, uint8) for weight but was " << weight->dtype;
+  ICHECK(weight->dtype == DataType::Int(8) || weight->dtype == DataType::UInt(8) ||
+         weight->dtype == DataType::Int(16))
+      << "Expected qnn conv2d type(int8, uint8, int16) for weight but was " << weight->dtype;
   ICHECK(param->out_dtype == DataType::Int(16) || param->out_dtype == DataType::Int(32) ||
          param->out_dtype == DataType::Int(64))
       << "Expected qnn conv2d type(int16, int32, int64) for output but was " << param->out_dtype;
@@ -74,13 +75,24 @@ bool QnnConv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
     ICHECK(axis != std::string::npos) << "Kernel layout attribute is not defined";
     AssignType(types[5], DataType::Float(32), weight->shape[axis], reporter);  // weight_scale
   } else {
-    // Here, total number of output channels depend on depth multiplier.
     size_t o_axis = param->kernel_layout.operator std::string().find('O');
     size_t i_axis = param->kernel_layout.operator std::string().find('I');
+    size_t d_axis = param->data_layout.operator std::string().find('C');
     ICHECK(o_axis != std::string::npos || i_axis != std::string::npos)
         << "Kernel layout attribute is not defined";
-    AssignType(types[5], DataType::Float(32), weight->shape[i_axis] * weight->shape[o_axis],
-               reporter);  // weight_scale
+    ICHECK(d_axis != std::string::npos) << "Data layout attribute is not defined";
+    if (param->channels.defined() &&
+        tvm::tir::ExprDeepEqual()(param->groups, data->shape[d_axis]) &&
+        tvm::tir::ExprDeepEqual()(param->channels, weight->shape[i_axis])) {
+      // This is depthwise convolution
+      // Here, total number of output channels depend on depth multiplier.
+      AssignType(types[5], DataType::Float(32), weight->shape[i_axis] * weight->shape[o_axis],
+                 reporter);  // weight_scale
+    } else {
+      // This is grouped convolution
+      AssignType(types[5], DataType::Float(32), param->channels,
+                 reporter);  // weight_scale
+    }
   }
 
   // Collect the input tensor and output tensor devoid of scale and zero points to reuse Relay
@@ -859,7 +871,8 @@ operator to understand how to scale back the int32 output to (u)int8 or (u)int16
     .add_type_rel("QnnConv2D", QnnConv2DRel)
     .set_attr<TNonComputational>("TNonComputational", true)
     .set_attr<FTVMLegalize>("FTVMQnnCanonicalize", QnnConv2DCanonicalize)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", QnnConvInferCorrectLayout);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", QnnConvInferCorrectLayout)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 TVM_REGISTER_GLOBAL("relay.qnn.op._make.conv2d").set_body_typed(MakeQnnConv2D);
 

@@ -103,6 +103,24 @@ namespace relay {
   }
 
 /*!
+ * \brief Try to do the type inference over expr:
+ *
+ * Do the infer_type over each node in expr
+ *
+ * \param expr The IR expression
+ * \return infered expr if succeed.
+ */
+inline Expr InferType(const Expr& expr) {
+  auto mod = IRModule::FromExpr(expr);
+  mod = transform::InferType()(mod);
+  if (expr.as<FunctionNode>()) {
+    return mod->Lookup("main");
+  } else {
+    return mod->Lookup("main").as<FunctionNode>()->body;
+  }
+}
+
+/*!
  * \brief Try to match lhs and rhs via broadcasting rule, such that:
  *
  * rhs matches the dimension of lhs specified by lhs_axes
@@ -120,6 +138,17 @@ inline bool MatchBroadcastToLeftAxes(const TensorTypeNode* tlhs, const TensorTyp
   StructuralEqual equal;
   size_t base = tlhs->shape.size() - trhs->shape.size();
   size_t j = 0;
+
+  // handle case trhs is simple constant
+  if (trhs->shape.size() == 0 && rhs_value != nullptr && lhs_axes.size() > 0) {
+    *rhs_value = MakeExpandDims(*rhs_value, 0, lhs_axes.size());
+    for (size_t i = 0; i < lhs_axes.size(); i++) {
+      int repeat_value =
+          tlhs->shape[static_cast<size_t>(lhs_axes[j]->value)].as<IntImmNode>()->value;
+      *rhs_value = MakeRepeat(*rhs_value, repeat_value, i);
+    }
+    return true;
+  }
 
   ObjectPtr<SqueezeAttrs> squeeze_attrs;
   if (rhs_value != nullptr) {
@@ -439,43 +468,43 @@ inline bool IsEqualScalar(const Expr& a, const Expr& b) {
  * \param i element index
  * \return Converted scalar value, or None if conversion failed
  */
-static inline std::optional<long double> TryToScalar(const runtime::NDArray& array, size_t i = 0) {
+template <typename T>
+static inline std::optional<T> TryToScalar(const runtime::NDArray& array, size_t i = 0) {
   if (array->dtype.code == kDLInt) {
     if (array->dtype.bits == 8) {
-      return std::optional<long double>(reinterpret_cast<int8_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<int8_t*>(array->data)[i]);
     } else if (array->dtype.bits == 16) {
-      return std::optional<long double>(reinterpret_cast<int16_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<int16_t*>(array->data)[i]);
     } else if (array->dtype.bits == 32) {
-      return std::optional<long double>(reinterpret_cast<int32_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<int32_t*>(array->data)[i]);
     } else if (array->dtype.bits == 64) {
-      return std::optional<long double>(reinterpret_cast<int64_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<int64_t*>(array->data)[i]);
     }
   } else if (array->dtype.code == kDLUInt) {
     if (array->dtype.bits == 1) {  // bool
-      return std::optional<long double>(reinterpret_cast<uint8_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<uint8_t*>(array->data)[i]);
     } else if (array->dtype.bits == 8) {
-      return std::optional<long double>(reinterpret_cast<uint8_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<uint8_t*>(array->data)[i]);
     } else if (array->dtype.bits == 16) {
-      return std::optional<long double>(reinterpret_cast<uint16_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<uint16_t*>(array->data)[i]);
     } else if (array->dtype.bits == 32) {
-      return std::optional<long double>(reinterpret_cast<uint32_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<uint32_t*>(array->data)[i]);
     } else if (array->dtype.bits == 64) {
-      return std::optional<long double>(reinterpret_cast<uint64_t*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<uint64_t*>(array->data)[i]);
     }
   } else if (array->dtype.code == kDLFloat) {
     if (array->dtype.bits == 16) {
-      return std::optional<long double>(
-          __extendXfYf2__<uint16_t, uint16_t, 10, float, uint32_t, 23>(
-              reinterpret_cast<uint16_t*>(array->data)[i]));
+      return std::optional<T>(__extendXfYf2__<uint16_t, uint16_t, 10, float, uint32_t, 23>(
+          reinterpret_cast<uint16_t*>(array->data)[i]));
     }
     if (array->dtype.bits == 32) {
-      return std::optional<long double>(reinterpret_cast<float*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<float*>(array->data)[i]);
     } else if (array->dtype.bits == 64) {
-      return std::optional<long double>(reinterpret_cast<double*>(array->data)[i]);
+      return std::optional<T>(reinterpret_cast<double*>(array->data)[i]);
     }
   } else if (array->dtype.code == kDLBfloat) {
     if (array->dtype.bits == 16) {
-      return std::optional<long double>(__extendXfYf2__<uint16_t, uint16_t, 7, float, uint32_t, 23>(
+      return std::optional<T>(__extendXfYf2__<uint16_t, uint16_t, 7, float, uint32_t, 23>(
           reinterpret_cast<uint16_t*>(array->data)[i]));
     }
   }
@@ -488,8 +517,15 @@ static inline std::optional<long double> TryToScalar(const runtime::NDArray& arr
  * \param i element index
  * \return Converted scalar value
  */
+template <typename T>
+static inline T ToScalar(const runtime::NDArray& array, size_t i = 0) {
+  auto try_value = TryToScalar<T>(array, i);
+  ICHECK(try_value) << "Unknown data type: " << tvm::runtime::DLDataType2String(array->dtype);
+  return try_value.value();
+}
+
 static inline long double ToScalar(const runtime::NDArray& array, size_t i = 0) {
-  auto try_value = TryToScalar(array, i);
+  auto try_value = TryToScalar<long double>(array, i);
   ICHECK(try_value) << "Unknown data type: " << tvm::runtime::DLDataType2String(array->dtype);
   return try_value.value();
 }
@@ -505,7 +541,7 @@ static inline Array<Integer> ToVector(const runtime::NDArray& array) {
   size_t len = array.Shape().front();
   Array<Integer> out;
   for (size_t i = 0; i < len; ++i) {
-    long double elem_val = ToScalar(array, i);
+    uint64_t elem_val = ToScalar<uint64_t>(array, i);
     out.push_back(Integer(IntImm(DataType::Int(32), static_cast<int64_t>(elem_val))));
   }
   return out;
@@ -661,6 +697,13 @@ inline Expr FixedPointMultiply(Expr x, int32_t multiplier, int32_t shift) {
   return Call(op, {x}, Attrs(attrs), {});
 }
 
+inline Expr FixedPointMultiplyPerAxis(Expr x, Expr m, Expr lshift, Expr rshift,
+                                      bool is_lshift_required, bool is_rshift_required,
+                                      Array<Integer> axes) {
+  return MakeFixedPointMultiplyPerAxis(x, m, lshift, rshift, is_lshift_required, is_rshift_required,
+                                       axes);
+}
+
 inline Expr Add(Expr lhs, Expr rhs) {
   static const Op& op = Op::Get("add");
   return Call(op, {lhs, rhs}, Attrs(), {});
@@ -732,6 +775,10 @@ inline Expr ReshapeLike(Expr lhs, Expr rhs, int lhs_begin, Integer lhs_end, int 
 inline Expr Copy(Expr data) {
   static const Op& op = Op::Get("copy");
   return Call(op, {data}, Attrs(), {});
+}
+
+inline Expr Max(Expr data, Array<Integer> axis, bool keepdims, bool exclude) {
+  return MakeReduce(data, axis, keepdims, exclude, "max");
 }
 
 inline Expr Mean(Expr data, Array<Integer> axis, bool keepdims, bool exclude) {

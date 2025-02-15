@@ -47,6 +47,30 @@ using PassInfoNode = tvm::transform::PassInfoNode;
 using PassContext = tvm::transform::PassContext;
 using PassContextNode = tvm::transform::PassContextNode;
 using Sequential = tvm::transform::Sequential;
+using FTVMRelayToTIR = tvm::transform::Pass;
+/*!
+ * \brief TIRToRuntime conversion specific to a TargetKind
+ *
+ * This function is responsible for scanning an IRModule for appropriate Target-specific functions
+ and generating a Runtime module representing the compiled output
+ *
+ * \param ir_module Unified IRModule
+ * \param target Target to filter on or retrieve arguments from
+ * \return Runtime Module containing compiled functions
+ */
+using FTVMTIRToRuntime = tvm::runtime::TypedPackedFunc<runtime::Module(IRModule, Target)>;
+
+/*!
+ * \brief RelayToTIR tvm::transform::Pass specific to a TargetKind
+ *
+ * Called before the default lowering passes.
+ *
+ * \param mod The module that an optimization pass runs on.
+ * \param pass_ctx The pass context that can provide information for the optimization.
+ *
+ * \return The transformed module.
+ */
+using FTVMRelayToTIR = tvm::transform::Pass;
 
 /*
  * \brief Create a function pass.
@@ -60,7 +84,7 @@ using Sequential = tvm::transform::Sequential;
  */
 TVM_DLL Pass CreateFunctionPass(
     const runtime::TypedPackedFunc<Function(Function, IRModule, PassContext)>& pass_func,
-    int opt_level, String name, tvm::Array<String> required);
+    int opt_level, String name, tvm::Array<String> required, bool traceable = false);
 
 /*! \brief Remove let-bound expressions which do not effect the program result.
  *
@@ -120,9 +144,12 @@ TVM_DLL Pass FoldConstant(bool fold_qnn = false);
 /*!
  * \brief Split function with huge number of arguments to smaller pieces.
  *
+ * \param max_function_args Maximum number of function arguments. If it equals 0 then SplitArgs
+ *                          shouldn't split the function.
+ *
  * \return The pass.
  */
-TVM_DLL Pass SplitArgs(int max_function_args);
+TVM_DLL Pass SplitArgs(uint64_t max_function_args);
 
 /*!
  * \brief Fuse operations into expr into separate functions.
@@ -468,6 +495,13 @@ TVM_DLL Pass RemoveUnusedFunctions(Array<runtime::String> entry_functions);
 TVM_DLL Pass SimplifyExpr();
 
 /*!
+ * \brief Stripped down version of SimplifyExpr which is run after AlterOpLayout.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass SimplifyExprPostAlterOp();
+
+/*!
  * \brief Run any custom passes registered under "RelayToTIR" attributes on TargetKinds.
  *
  * This pass looks for inline, let-bound or global functions which have a "Compiler" attribute.
@@ -482,7 +516,7 @@ TVM_DLL Pass SimplifyExpr();
  * A typical custom pass will:
  *  - Find calls to "Compiler" attributes functions with matching compiler name.
  *  - Lower those function to TIR PrimFuncs.
- *  - Bind those functions into the IRModule under the the functions' "global_symbol" attribute.
+ *  - Bind those functions into the IRModule under the functions' "global_symbol" attribute.
  *  - Replace all calls to those functions with 'call_lowered' to the matching global.
  * Care should be taken to handle multiple calls to the same function.
  * See src/relay/backend/contrib/example_target_hooks/relay_to_tir.cc for an example custom pass.
@@ -584,7 +618,7 @@ TVM_DLL Pass CapturePostDfsIndexInSpans();
  * \brief Calls device dependent memory scope analysis pass, collects mapping of desirable
  * expr->memory_scope and annotates expressions by VirtualDevice with required memory_scope
  */
-TVM_DLL Pass AnnotateMemoryScope(CompilationConfig config);
+TVM_DLL Pass AnnotateMemoryScope();
 
 /*!
  * \brief Removes non-fused reshapes after lowering the graph.
@@ -709,6 +743,10 @@ TVM_DLL Function UnCPS(const Function& f);
  * \return the deduplicated expression.
  */
 TVM_DLL Expr DeDup(const Expr& e);
+
+namespace legalize {
+TVM_DLL Expr Legalize(const Expr& expr, const std::string& legalize_map_attr_name);
+}  // namespace legalize
 
 }  // namespace relay
 }  // namespace tvm

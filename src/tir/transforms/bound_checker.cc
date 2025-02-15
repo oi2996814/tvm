@@ -34,6 +34,8 @@
 #include <utility>
 #include <vector>
 
+#include "../../arith/unwrap_vector_expr.h"
+
 namespace tvm {
 namespace tir {
 
@@ -76,16 +78,6 @@ class BoundChecker : public StmtExprMutator {
       unsafe_rewritten_ = true;
     }
     return StmtExprMutator::VisitExpr_(op);
-  }
-
-  PrimExpr VisitExpr_(const LoadNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
-    return PrimExpr();
-  }
-
-  Stmt VisitStmt_(const StoreNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
-    return Stmt();
   }
 
   Stmt VisitStmt_(const BufferStoreNode* op) final {
@@ -166,7 +158,12 @@ class BoundChecker : public StmtExprMutator {
         if (!IsValidScalar(ramp_index->stride)) {
           return false;
         }
-        if (ramp_index->lanes <= 0) {
+        bool lanes_int = ramp_index->lanes->IsInstance<IntImmNode>();
+        if (!lanes_int) {
+          return false;
+        }
+        int lanes = static_cast<int>(Downcast<IntImm>(ramp_index->lanes)->value);
+        if (lanes <= 0) {
           return false;
         }
       }
@@ -202,11 +199,7 @@ class BoundChecker : public StmtExprMutator {
         PrimExpr upper_bound = shape[i];
 
         if (const RampNode* ramp_index = index.as<RampNode>()) {
-          // In case index is base + stride * i.
-          // Non inclusive range.
-          index = Add(ramp_index->base,
-                      Mul(ramp_index->stride,
-                          make_const(ramp_index->stride.dtype(), ramp_index->lanes - 1)));
+          index = arith::UnwrapVectorExpr(GetRef<Ramp>(ramp_index), ramp_index->lanes);
         }
 
         // Try to simplify index and bound.

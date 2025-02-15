@@ -28,6 +28,7 @@
 #include <dlpack/dlpack.h>
 #include <dmlc/json.h>
 #include <dmlc/memory_io.h>
+#include <tvm/runtime/memory/memory_manager.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/packed_func.h>
 
@@ -42,6 +43,10 @@
 namespace tvm {
 namespace runtime {
 
+using memory::AllocatorType;
+using memory::MemoryManager;
+using tvm::runtime::memory::Storage;
+
 /*! \brief macro to do C API call */
 #define TVM_CCALL(func)                     \
   {                                         \
@@ -52,6 +57,7 @@ namespace runtime {
 /*! \brief operator attributes about tvm op */
 struct TVMOpParam {
   std::string func_name;
+  std::string compiler;
   std::unordered_map<std::string, ObjectRef> attrs;
   uint32_t num_inputs;
   uint32_t num_outputs;
@@ -66,7 +72,7 @@ struct TVMOpParam {
  */
 class TVM_DLL GraphExecutor : public ModuleNode {
   struct OpArgs {
-    std::vector<DLTensor> args;
+    std::vector<DLTensor*> args;
     std::vector<TVMValue> arg_values;
     std::vector<int> arg_tcodes;
     std::vector<int64_t> shape_data;
@@ -81,13 +87,16 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \param sptr_to_self The pointer to the module node.
    * \return The corresponding member function.
    */
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
 
   /*!
    * \return The type key of the executor.
    */
   const char* type_key() const final { return "GraphExecutor"; }
   void Run();
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final { return ModulePropertyMask::kRunnable; }
 
   /*!
    * \brief Initialize the graph executor with graph and device.
@@ -116,6 +125,12 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \return The shape and dtype tuple.
    */
   std::tuple<ShapeInfo, DtypeInfo> GetInputInfo() const;
+
+  /*!
+   * \brief Get the output info of Graph by parsing the output nodes.
+   * \return The shape and dtype tuple.
+   */
+  std::tuple<ShapeInfo, DtypeInfo> GetOutputInfo() const;
 
   /*!
    * \brief Get the output index given the name of output.
@@ -210,6 +225,7 @@ class TVM_DLL GraphExecutor : public ModuleNode {
     int param_data_entry;
     NDArray linked_param;
     std::string scope;
+    int64_t alloc_size{-1};
     //    PoolEntry(int s, int dev_type, void* pre_linked_param) :
     //        size(s), device_type(dev_type), pre_linked_param(std::move(pre_linked_param)) {}
   };
@@ -259,6 +275,9 @@ class TVM_DLL GraphExecutor : public ModuleNode {
         if (key == "func_name") {
           param->func_name = value;
           bitmask |= 1;
+        }
+        if (key == "Compiler") {
+          param->compiler = value;
         } else if (key == "num_inputs") {
           param->num_inputs = strtoul(value.c_str(), nullptr, 10);
           bitmask |= 2;
@@ -427,8 +446,8 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \param args The arguments to the functor, including inputs and outputs.
    * \return The created executor.
    */
-  std::pair<std::function<void()>, std::shared_ptr<OpArgs>> CreateTVMOp(
-      const TVMOpParam& attrs, const std::vector<DLTensor>& args);
+  std::tuple<std::function<void()>, std::function<void(TVMRetValue*)>, std::shared_ptr<OpArgs>>
+  CreateTVMOp(const TVMOpParam& attrs, const std::vector<DLTensor*>& args);
   // Get node entry index.
   uint32_t entry_id(uint32_t nid, uint32_t index) const { return node_row_ptr_[nid] + index; }
   // Get node entry index.
@@ -451,6 +470,10 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   std::vector<std::vector<DLTensor*>> output_dltensors_;
   /*! \brief Used for quick node(both model output and op input) DLTensor* lookup given an eid. */
   std::vector<std::vector<DLTensor*>> both_output_opinput_dltensors_;
+  /*! \brief Used for quick node output DLTensor* lookup given a nop's input eid. */
+  std::unordered_map<int, std::vector<DLTensor*>> node_output_dltensors_;
+  /*! \brief Used for quick entry_id lookup given an storage_id. */
+  std::vector<std::vector<uint32_t>> sid_to_eid_;
   /*! \brief Used for quick entry indexing. */
   std::vector<uint32_t> node_row_ptr_;
   /*! \brief Output entries. */
@@ -462,13 +485,17 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   /*! \brief Execution context of all devices including the host. */
   std::vector<Device> devices_;
   /*! \brief Common storage pool for all devices. */
-  std::vector<NDArray> storage_pool_;
+  std::vector<Storage> storage_pool_;
+  /*! \brief Common NDArray pool for all devices. */
+  std::vector<NDArray> ndarray_pool_;
   /*! \brief Data entry of each node. */
   std::vector<NDArray> data_entry_;
   /*! \brief Data alignment of each node. */
   std::vector<size_t> data_alignment_;
   /*! \brief Operator on each node. */
   std::vector<std::function<void()>> op_execs_;
+  /*! \brief Profilable Operator on each node. */
+  std::vector<std::function<void(TVMRetValue*)>> op_profile_execs_;
   /*! \brief Linked parameter lookup function. */
   PackedFunc lookup_linked_param_;
   /*! \brief Module's _lookup_linked_param function, used by DefaultLookupLinkedParam. */

@@ -114,6 +114,11 @@ if(DEFINED USE_HEXAGON_GTEST)
   set(GTEST_FLAG "-DUSE_HEXAGON_GTEST=${USE_HEXAGON_GTEST}")
 endif()
 
+if(NOT DEFINED USE_HEXAGON_QHL)
+  # USE_HEXAGON_QHL defaults to ON for rpc runtime if not explicitly set to OFF
+  set(USE_HEXAGON_QHL ON)
+endif()
+
 ExternalProject_Add(hexagon_tvm_runtime_rpc
   SOURCE_DIR "${TVM_SOURCE_DIR}"
   BUILD_COMMAND $(MAKE) runtime hexagon_rpc_sim
@@ -124,6 +129,8 @@ ExternalProject_Add(hexagon_tvm_runtime_rpc
     "-DCMAKE_CXX_COMPILER=${USE_HEXAGON_TOOLCHAIN}/bin/hexagon-clang++"
     "-DUSE_HEXAGON_SDK=${USE_HEXAGON_SDK}"
     "-DUSE_HEXAGON_ARCH=${USE_HEXAGON_ARCH}"
+    "-DUSE_HEXAGON_EXTERNAL_LIBS=${USE_HEXAGON_EXTERNAL_LIBS}"
+    "-DHEXAGON_EXTERNAL_LIBS_SHA=${HEXAGON_EXTERNAL_LIBS_SHA}"
     "-DCMAKE_CXX_STANDARD=17"
     "-DUSE_LIBBACKTRACE=OFF"
     "-DUSE_RPC=OFF"
@@ -133,7 +140,7 @@ ExternalProject_Add(hexagon_tvm_runtime_rpc
     "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
     "-DUSE_ALTERNATIVE_LINKER=OFF"
     "-DUSE_CUSTOM_LOGGING=ON"
-    "-DUSE_HEXAGON_QHL=ON"
+    "-DUSE_HEXAGON_QHL=${USE_HEXAGON_QHL}"
     "-DUSE_RANDOM=ON"
     "${GTEST_FLAG}"
   INSTALL_COMMAND ""

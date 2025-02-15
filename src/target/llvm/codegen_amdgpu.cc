@@ -42,7 +42,10 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
+#if TVM_LLVM_VERSION < 170
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
+#endif
+#include <llvm/IR/Module.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <tvm/runtime/c_runtime_api.h>
 #include <tvm/runtime/device_api.h>
@@ -85,9 +88,9 @@ class CodeGenAMDGPU : public CodeGenLLVM {
   CodeGenAMDGPU() = default;
   virtual ~CodeGenAMDGPU() = default;
 
-  void AddFunction(const PrimFunc& f) final {
+  void AddFunction(const GlobalVar& gvar, const PrimFunc& f) final {
     // add function as void return value
-    CodeGenLLVM::AddFunctionInternal(f, true);
+    CodeGenLLVM::AddFunctionInternal(gvar, f);
     function_->setCallingConv(llvm::CallingConv::AMDGPU_KERNEL);
     std::ostringstream attr;
     attr << "1," << DetectROCMmaxThreadsPerBlock();
@@ -144,7 +147,8 @@ class CodeGenAMDGPU : public CodeGenLLVM {
     }
 
     buf = builder_->CreatePointerCast(
-        buf, DTypeToLLVMType(op->dtype)->getPointerTo(buf->getType()->getPointerAddressSpace()));
+        buf,
+        llvmGetPointerTo(DTypeToLLVMType(op->dtype), buf->getType()->getPointerAddressSpace()));
     ICHECK(!var_map_.count(op->buffer_var.get()));
     var_map_[op->buffer_var.get()] = buf;
     this->VisitStmt(op->body);
@@ -184,8 +188,14 @@ class CodeGenAMDGPU : public CodeGenLLVM {
           LOG(FATAL) << "unknown workgroup idx";
       }
     }
+#if TVM_LLVM_VERSION >= 200
+    llvm::Function* f = llvm::cast<llvm::Function>(
+        llvm::Intrinsic::getOrInsertDeclaration(module_.get(), intrin_id, {}));
+#else
     llvm::Function* f = llvm::Intrinsic::getDeclaration(module_.get(), intrin_id);
-    return builder_->CreateCall(f, {});
+#endif
+    llvm::Value* result = builder_->CreateCall(f, {});
+    return this->CreateCast(DataType::Int(32), iv->var->dtype, result);
   }
 
   llvm::Value* CreateStorageSync(const CallNode* op) final {
@@ -193,18 +203,25 @@ class CodeGenAMDGPU : public CodeGenLLVM {
     if (sync == "warp") {
       return nullptr;
     } else if (sync == "shared") {
+#if TVM_LLVM_VERSION >= 200
+      llvm::Function* f = llvm::cast<llvm::Function>(llvm::Intrinsic::getOrInsertDeclaration(
+          module_.get(), llvm::Intrinsic::amdgcn_s_barrier, {}));
+#else
       llvm::Function* f =
           llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::amdgcn_s_barrier);
+#endif
       return builder_->CreateCall(f, {});
     } else {
       LOG(FATAL) << "Do not support sync " << sync;
-      return nullptr;
     }
   }
 
+#if TVM_LLVM_VERSION < 160
+  // This function only works with the legacy pass manager.
   void InitPassManagerBuilder(llvm::PassManagerBuilder* builder) final {
     // Additional optimization hook to tweak the builder.
   }
+#endif
 
   unsigned GetGlobalAddressSpace() const final { return 1; }
 
@@ -256,13 +273,9 @@ runtime::Module BuildAMDGPU(IRModule mod, Target target) {
 #endif
   auto cg = std::make_unique<CodeGenAMDGPU>();
 
-  cg->Init("TVMAMDGPUModule", llvm_target.get(), false, false, false);
+  cg->Init("TVMAMDGPUModule", llvm_target.get(), NullOpt, false, false);
 
-  cg->AddFunctionsOrdered(mod->functions.begin(), mod->functions.end(), [](auto& kv) {
-    ICHECK(kv.second->template IsInstance<PrimFuncNode>())
-        << "Can only lower IR Module with PrimFuncs";
-    return Downcast<PrimFunc>(kv.second);
-  });
+  cg->AddFunctionsOrdered(mod->functions.begin(), mod->functions.end());
 
   llvm::TargetMachine* tm = llvm_target->GetOrCreateTargetMachine();
   const auto* find_rocm_bitcodes = tvm::runtime::Registry::Get("tvm_callback_rocm_bitcode_path");
@@ -301,9 +314,12 @@ runtime::Module BuildAMDGPU(IRModule mod, Target target) {
 #elif TVM_LLVM_VERSION <= 90
   ICHECK(tm->addPassesToEmitFile(pass, destObj, nullptr, llvm::TargetMachine::CGFT_ObjectFile) == 0)
       << "Cannot emit target CGFT_ObjectFile";
-#else
+#elif TVM_LLVM_VERSION <= 170
   ICHECK(tm->addPassesToEmitFile(pass, destObj, nullptr, llvm::CGFT_ObjectFile) == 0)
       << "Cannot emit target CGFT_ObjectFile";
+#else
+  ICHECK(tm->addPassesToEmitFile(pass, destObj, nullptr, llvm::CodeGenFileType::ObjectFile) == 0)
+      << "Cannot emit target CodeGenFileType::ObjectFile";
 #endif
   pass.run(*mObj);
   std::string obj(dataObj.begin(), dataObj.end());
@@ -316,8 +332,12 @@ runtime::Module BuildAMDGPU(IRModule mod, Target target) {
   ICHECK(tm->addPassesToEmitFile(passAsm, destAsm, nullptr,
                                  llvm::TargetMachine::CGFT_AssemblyFile) == 0)
       << "Cannot emit target CGFT_AssemblyFile";
-#else
+#elif TVM_LLVM_VERSION <= 170
   ICHECK(tm->addPassesToEmitFile(passAsm, destAsm, nullptr, llvm::CGFT_AssemblyFile) == 0)
+      << "Cannot emit target CGFT_AssemblyFile";
+#else
+  ICHECK(tm->addPassesToEmitFile(passAsm, destAsm, nullptr, llvm::CodeGenFileType::AssemblyFile) ==
+         0)
       << "Cannot emit target CGFT_AssemblyFile";
 #endif
   passAsm.run(*mAsm);

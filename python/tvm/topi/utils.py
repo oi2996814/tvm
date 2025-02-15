@@ -22,8 +22,9 @@ from numbers import Integral
 
 import numpy as np
 import tvm
-from tvm import relay, te
-from tvm.tir import bijective_layout, layout
+from tvm import te
+from tvm.tir import Any, SizeVar, bijective_layout, layout
+
 from . import cpp, tag
 
 
@@ -225,9 +226,7 @@ def const_vector(vector, name="const_vector"):
         now = tvm.tir.const(0.0, dtype)
         for ii in range(row):
             now = tvm.tir.Select(
-                tvm.tir.all(idxm(i, row) == ii),
-                tvm.tir.const(vector[ii], dtype),
-                now,
+                tvm.tir.all(idxm(i, row) == ii), tvm.tir.const(vector[ii], dtype), now
             )
         return now
 
@@ -325,7 +324,7 @@ def unravel_index(idx, shape):
     return indices
 
 
-def const_matrix(matrix, name="const_matrix"):
+def const_matrix(matrix, name="const_matrix", attrs=None):
     """convert a const numpy 2-dimensional matrix to tvm tensor
 
     Parameters
@@ -355,15 +354,10 @@ def const_matrix(matrix, name="const_matrix"):
                 )
         return now
 
-    return te.compute(
-        matrix.shape,
-        select_array,
-        name=name,
-        attrs={
-            "const_matrix": True,
-            "schedule_rule": "meta_schedule.compute_inline",
-        },
-    )
+    if attrs is None:
+        attrs = {"const_matrix": True, "schedule_rule": "None"}
+
+    return te.compute(matrix.shape, select_array, name=name, attrs=attrs)
 
 
 def get_max_power2_factor(n, max_value=None):
@@ -420,42 +414,12 @@ def get_shape(src_shape, src_layout, dst_layout):
     if isinstance(dst_layout, str):
         dst_layout = layout(dst_layout)
 
-    assert len(src_layout) == len(dst_layout), "Incompatible layout %s vs %s" % (
-        src_layout,
-        dst_layout,
-    )
+    assert len(src_layout) == len(dst_layout), f"Incompatible layout {src_layout} vs {dst_layout}"
 
     layout_mapping = bijective_layout(src_layout, dst_layout)
     dst_indices = layout_mapping.forward_index(tvm.runtime.convert(list(range(len(src_layout)))))
 
     return get_const_tuple(tuple([src_shape[i.value] for i in dst_indices]))
-
-
-def change_constant_shape(src, src_layout, dst_layout):
-    """Makes a copy of a Relay constant, reshaping it to a new data layout.
-
-    Parameter
-    ---------
-    src : relay.Constant
-        The Constant to be reformatted.
-
-    src_layout : str
-        The current layout of the Relay constant. Must be alphabetic (e.g. NHWC
-        or OIHW, but not NCHW2c).
-
-    dst_layout : str
-        The desired layout of new the Relay constant. Must be alphabetic (e.g. NHWC
-        or OIHW, but not NCHW2c).
-
-    Returns
-    -------
-    dst_shape : relay.Constant
-        A copy of the Constant with the new layout.
-    """
-    assert src_layout.isalpha() and dst_layout.isalpha()
-    axis_order = [src_layout.index(c) for c in dst_layout]
-    reshaped = np.transpose(src.data.numpy(), axis_order)
-    return relay.Constant(tvm.nd.array(reshaped))
 
 
 def within_index(b, e, s, i):
@@ -557,3 +521,8 @@ def is_target(names):
     names = [names] if isinstance(names, str) else names
     target = tvm.target.Target.current(allow_none=False)
     return any(name in target.keys for name in names)
+
+
+def is_dynamic_shape(shape):
+    """Checks if any part of a shape is dynamic"""
+    return any([isinstance(x, (Any, SizeVar)) for x in shape])

@@ -21,11 +21,11 @@
  * \file index_map.cc
  */
 
-#include "tvm/tir/index_map.h"
-
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/int_set.h>
 #include <tvm/arith/iter_affine_map.h>
+#include <tvm/ir/name_supply.h>
+#include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 
@@ -55,7 +55,9 @@ IndexMap IndexMap::FromFunc(int ndim, runtime::TypedPackedFunc<Array<PrimExpr>(A
 
 std::pair<IndexMap, PrimExpr> IndexMapInverseImpl(const IndexMap& self,
                                                   const Array<Range>& initial_ranges,
-                                                  arith::IterMapLevel check_level) {
+                                                  arith::IterMapLevel check_level,
+                                                  arith::Analyzer* analyzer) {
+  ICHECK(analyzer != nullptr);
   if (self->inverse_index_map.defined()) {
     // return the pre-defined inverse index map if exists.  In this
     // case, the user-defined inverse is assumed to be correct and
@@ -88,9 +90,8 @@ std::pair<IndexMap, PrimExpr> IndexMapInverseImpl(const IndexMap& self,
 
   // Unpack the output indices into linear combinations of the initial
   // indices.
-  arith::Analyzer analyzer;
-  auto padded_iter_map = DetectIterMap(self->final_indices, input_iters, /* predicate = */ 1,
-                                       /*check_level=*/check_level, &analyzer,
+  auto padded_iter_map = DetectIterMap(self->final_indices, input_iters, /*predicate=*/1,
+                                       /*check_level=*/check_level, analyzer,
                                        /*simplify_trivial_iterators=*/false);
   CHECK(padded_iter_map->errors.empty()) << "Could not parse mapping as sum of iterators.  "
                                          << "Error: " << padded_iter_map->errors[0];
@@ -110,15 +111,15 @@ std::pair<IndexMap, PrimExpr> IndexMapInverseImpl(const IndexMap& self,
     } else {
       expr = inverse_exprs_map.at(index);
     }
-    inverse_exprs.push_back(analyzer.Simplify(expr));
+    inverse_exprs.push_back(analyzer->Simplify(expr));
   }
 
   PrimExpr padding_predicate = padded_iter_map->padding_predicate;
   padding_predicate = arith::NormalizeIterMapToExpr(padding_predicate);
   padding_predicate = Substitute(padding_predicate, inverse_exprs_map);
 
+  auto output_ranges = self->MapRanges(initial_ranges, analyzer);
   {
-    auto output_ranges = self->MapRanges(initial_ranges);
     ICHECK_EQ(output_ranges.size(), output_vars.size());
 
     arith::Analyzer analyzer;
@@ -133,15 +134,17 @@ std::pair<IndexMap, PrimExpr> IndexMapInverseImpl(const IndexMap& self,
   return {IndexMap(output_vars, inverse_exprs), padding_predicate};
 }
 
-std::pair<IndexMap, PrimExpr> IndexMap::NonSurjectiveInverse(Array<Range> initial_ranges) const {
-  return IndexMapInverseImpl(*this, initial_ranges, arith::IterMapLevel::NoCheck);
+std::pair<IndexMap, PrimExpr> IndexMap::NonSurjectiveInverse(Array<Range> initial_ranges,
+                                                             arith::Analyzer* analyzer) const {
+  ICHECK(analyzer != nullptr);
+  return IndexMapInverseImpl(*this, initial_ranges, arith::IterMapLevel::NoCheck, analyzer);
 }
 
-IndexMap IndexMap::Inverse(Array<Range> initial_ranges) const {
+IndexMap IndexMap::Inverse(Array<Range> initial_ranges, arith::Analyzer* analyzer) const {
+  ICHECK(analyzer != nullptr);
   auto [inverse, padding_predicate] =
-      IndexMapInverseImpl(*this, initial_ranges, arith::IterMapLevel::Bijective);
-  arith::Analyzer analyzer;
-  CHECK(analyzer.CanProve(!padding_predicate))
+      IndexMapInverseImpl(*this, initial_ranges, arith::IterMapLevel::Bijective, analyzer);
+  CHECK(analyzer->CanProve(!padding_predicate))
       << "Bijective inverse should not contain padding, but inverse of " << *this << " over range "
       << initial_ranges << " resulted in a padding predicate of " << padding_predicate;
   return inverse;
@@ -149,6 +152,7 @@ IndexMap IndexMap::Inverse(Array<Range> initial_ranges) const {
 
 Array<PrimExpr> IndexMapNode::MapIndices(const Array<PrimExpr>& indices,
                                          arith::Analyzer* analyzer) const {
+  ICHECK(analyzer != nullptr);
   ICHECK_EQ(indices.size(), initial_indices.size());
 
   Map<Var, PrimExpr> vmap;
@@ -157,30 +161,22 @@ Array<PrimExpr> IndexMapNode::MapIndices(const Array<PrimExpr>& indices,
     vmap.Set(initial_indices[i], indices[i]);
   }
 
-  arith::Analyzer local_analyzer;
-  if (!analyzer) {
-    analyzer = &local_analyzer;
-  }
-
-  Array<PrimExpr> output = final_indices.Map(
-      [&](PrimExpr index) { return analyzer->Simplify(Substitute(std::move(index), vmap)); });
-
+  Array<PrimExpr> output = final_indices.Map([&](PrimExpr index) {
+    PrimExpr result = SubstituteWithDataTypeLegalization(
+        std::move(index), [&](const Var& var) { return vmap.Get(var); });
+    return analyzer->Simplify(result);
+  });
   return output;
 }
 
 Array<Range> IndexMapNode::MapRanges(const Array<Range>& ranges, arith::Analyzer* analyzer) const {
+  ICHECK(analyzer != nullptr);
   ICHECK_EQ(ranges.size(), initial_indices.size());
 
   Map<Var, Range> input_iters;
   for (size_t i = 0; i < initial_indices.size(); i++) {
     input_iters.Set(initial_indices[i], ranges[i]);
   }
-
-  arith::Analyzer local_analyzer;
-  if (!analyzer) {
-    analyzer = &local_analyzer;
-  }
-
   auto iter_map = DetectIterMap(final_indices, input_iters, /* predicate = */ 1,
                                 /*check_level=*/arith::IterMapLevel::NoCheck, analyzer,
                                 /*simplify_trivial_iterators=*/false);
@@ -218,16 +214,32 @@ Array<Range> IndexMapNode::MapRanges(const Array<Range>& ranges, arith::Analyzer
                                             analyzer->Simplify(int_set.max() - int_set.min() + 1)));
     }
   }
+  auto output_dtype = [&]() {
+    int max_bits = 0;
+    for (const auto& range : ranges) {
+      max_bits = std::max(max_bits, range->extent.dtype().bits());
+    }
+    return DataType::Int(max_bits);
+  }();
+  output.MutateByApply([&](const Range& range) {
+    if (range->min.dtype() != output_dtype || range->extent.dtype() != output_dtype) {
+      return Range::FromMinExtent(cast(output_dtype, range->min),
+                                  cast(output_dtype, range->extent));
+    } else {
+      return range;
+    }
+  });
   return output;
 }
 
 Array<PrimExpr> IndexMapNode::MapShape(const Array<PrimExpr>& shape,
                                        arith::Analyzer* analyzer) const {
+  ICHECK(analyzer != nullptr);
   ICHECK_EQ(shape.size(), initial_indices.size());
 
   Array<Range> ranges;
   for (auto& dim : shape) {
-    ranges.push_back(Range(0, dim));
+    ranges.push_back(Range(make_zero(dim.dtype()), dim));
   }
   Array<Range> mapped = MapRanges(std::move(ranges), analyzer);
 
@@ -241,6 +253,7 @@ Array<PrimExpr> IndexMapNode::MapShape(const Array<PrimExpr>& shape,
 }
 
 runtime::NDArray IndexMapNode::MapNDArray(runtime::NDArray arr_src) const {
+  arith::Analyzer analyzer;
   auto shape = arr_src.Shape();
   ICHECK(shape.size() == initial_indices.size())
       << "The rank of the input array should be " << initial_indices.size() << " but got "
@@ -251,7 +264,7 @@ runtime::NDArray IndexMapNode::MapNDArray(runtime::NDArray arr_src) const {
     size_1d *= shape[i];
     orig_shape.push_back(PrimExpr(static_cast<int>((shape[i]))));
   }
-  auto dst_shape = MapShape(orig_shape);
+  auto dst_shape = MapShape(orig_shape, &analyzer);
 
   std::vector<int64_t> dst_shape_int;
   for (size_t i = 0; i < dst_shape.size(); ++i) {
@@ -275,7 +288,7 @@ runtime::NDArray IndexMapNode::MapNDArray(runtime::NDArray arr_src) const {
       src_indices.push_back(PrimExpr(static_cast<int>((src_linear_index / div_factor))));
       src_linear_index %= div_factor;
     }
-    auto dst_indices = MapIndices(src_indices);
+    auto dst_indices = MapIndices(src_indices, &analyzer);
 
     // Convert an N-d coordinate to a linear coordinate
     // (z, y, x) -> z * height * width + y * width + x
@@ -294,8 +307,59 @@ runtime::NDArray IndexMapNode::MapNDArray(runtime::NDArray arr_src) const {
   return arr_dst;
 }
 
+IndexMap IndexMap::RenameVariables(
+    const std::function<Optional<String>(const Var& var)>& f_name_map) const {
+  std::unordered_set<std::string> used_names;
+  Map<Var, Var> var_remap;
+  NameSupply name_supply;
+  const IndexMapNode* n = this->get();
+  if (f_name_map != nullptr) {
+    // Collect variables with pre-defined names provided by f_name_map.
+    std::unordered_set<const Object*> visited;
+    std::for_each(n->final_indices.begin(), n->final_indices.end(), [&](const PrimExpr& expr) {
+      PostOrderVisit(expr, [&](const ObjectRef& obj) {
+        if (!obj->IsInstance<VarNode>()) {
+          return;
+        }
+        if (visited.count(obj.get())) {
+          return;
+        }
+        visited.emplace(obj.get());
+        Var var = Downcast<Var>(obj);
+        if (Optional<String> opt_name = f_name_map(var); opt_name.defined()) {
+          String name = opt_name.value();
+          ICHECK(!name_supply->ContainsName(name, /*add_prefix=*/false));
+          name_supply->ReserveName(name, /*add_prefix=*/false);
+          var_remap.Set(var, Var(name, var->dtype));
+        }
+      });
+    });
+  }
+
+  for (const Var& initial_index : n->initial_indices) {
+    if (var_remap.count(initial_index)) {
+      // The name of the variable is pre-defined.
+      continue;
+    }
+    String unique_name = name_supply->FreshName(initial_index->name_hint, /*add_prefix=*/false);
+    if (unique_name != initial_index->name_hint) {
+      var_remap.Set(initial_index, Var(unique_name));
+    }
+  }
+
+  auto new_initial_indices = n->initial_indices.Map(
+      [&](const Var& var) { return Downcast<Var>(Substitute(var, var_remap)); });
+  auto new_final_indices =
+      n->final_indices.Map([&](const PrimExpr& expr) { return Substitute(expr, var_remap); });
+  Optional<IndexMap> new_inverse_index_map = NullOpt;
+  if (n->inverse_index_map.defined()) {
+    new_inverse_index_map = Downcast<IndexMap>(n->inverse_index_map).RenameVariables(f_name_map);
+  }
+  return IndexMap(new_initial_indices, new_final_indices, new_inverse_index_map);
+}
+
 /*!
- * \brief Auxilarry function to comvert an index map to lambda expression in Python.
+ * \brief Auxilarry function to convert an index map to lambda expression in Python.
  * \param initial_indices The initial indices in the index map.
  * \param final_indices The final indices in the index map.
  * \return The lambda expression string.
@@ -304,47 +368,36 @@ std::string IndexMap2PythonLambdaExpr(const Array<Var>& initial_indices,
                                       const Array<PrimExpr>& final_indices) {
   std::unordered_set<std::string> used_names;
   Map<Var, PrimExpr> var_remap;
-  for (const Var& initial_index : initial_indices) {
-    if (used_names.count(initial_index->name_hint)) {
-      std::string new_name = initial_index->name_hint + std::to_string(used_names.size());
-      used_names.insert(new_name);
-      var_remap.Set(initial_index, Var(new_name));
-    } else {
-      used_names.insert(initial_index->name_hint);
-    }
-  }
   std::ostringstream oss;
   oss << "lambda ";
   for (size_t i = 0; i < initial_indices.size(); ++i) {
     if (i != 0) {
       oss << ", ";
     }
-    auto it = var_remap.find(initial_indices[i]);
-    if (it != var_remap.end()) {
-      oss << (*it).second;
-    } else {
-      oss << initial_indices[i];
-    }
+    oss << initial_indices[i];
   }
   oss << ": (";
   for (size_t i = 0; i < final_indices.size(); ++i) {
     if (i != 0) {
       oss << " ";
     }
-    oss << Substitute(final_indices[i], var_remap);
+    oss << final_indices[i];
     oss << ",";
   }
   oss << ")";
   return oss.str();
 }
 
-String IndexMapNode::ToPythonString() const {
-  std::string lambda_expr = IndexMap2PythonLambdaExpr(initial_indices, final_indices);
-  if (!inverse_index_map.defined()) {
+String IndexMapNode::ToPythonString(
+    const std::function<Optional<String>(const Var& var)>& f_name_map) const {
+  auto index_map = GetRef<IndexMap>(this).RenameVariables(f_name_map);
+  std::string lambda_expr =
+      IndexMap2PythonLambdaExpr(index_map->initial_indices, index_map->final_indices);
+  if (!index_map->inverse_index_map.defined()) {
     return String(lambda_expr);
   }
   // Also convert the inverse index map.
-  IndexMap inverse = Downcast<IndexMap>(inverse_index_map.value());
+  IndexMap inverse = Downcast<IndexMap>(index_map->inverse_index_map.value());
   std::string inverse_lambda_expr =
       IndexMap2PythonLambdaExpr(inverse->initial_indices, inverse->final_indices);
   std::ostringstream oss;
@@ -353,11 +406,16 @@ String IndexMapNode::ToPythonString() const {
   return String(oss.str());
 }
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<IndexMapNode>([](const ObjectRef& node, ReprPrinter* p) {
-      auto* op = static_cast<const IndexMapNode*>(node.get());
-      p->stream << "index_map(" << op->ToPythonString() << ")";
-    });
+IndexMap Substitute(const IndexMap& index_map,
+                    std::function<Optional<PrimExpr>(const Var& var)> f_subst) {
+  Array<PrimExpr> new_output =
+      index_map->final_indices.Map([&](const PrimExpr& expr) { return Substitute(expr, f_subst); });
+  Optional<IndexMap> new_inverse_map = NullOpt;
+  if (index_map->inverse_index_map.defined()) {
+    new_inverse_map = Substitute(Downcast<IndexMap>(index_map->inverse_index_map.value()), f_subst);
+  }
+  return IndexMap{index_map->initial_indices, new_output, new_inverse_map};
+}
 
 TVM_REGISTER_NODE_TYPE(IndexMapNode);
 
@@ -368,19 +426,29 @@ TVM_REGISTER_GLOBAL("tir.IndexMap")
     });
 
 TVM_REGISTER_GLOBAL("tir.IndexMapMapIndices")
-    .set_body_typed([](IndexMap map, Array<PrimExpr> indices) { return map->MapIndices(indices); });
+    .set_body_typed([](IndexMap map, Array<PrimExpr> indices) {
+      arith::Analyzer analyzer;
+      return map->MapIndices(indices, &analyzer);
+    });
 
 TVM_REGISTER_GLOBAL("tir.IndexMapMapShape").set_body_typed([](IndexMap map, Array<PrimExpr> shape) {
-  return map->MapShape(shape);
+  arith::Analyzer analyzer;
+  return map->MapShape(shape, &analyzer);
 });
-TVM_REGISTER_GLOBAL("tir.IndexMapInverse").set_body_method(&IndexMap::Inverse);
+
+TVM_REGISTER_GLOBAL("tir.IndexMapInverse")
+    .set_body_typed([](IndexMap map, Array<Range> initial_ranges) {
+      arith::Analyzer analyzer;
+      return map.Inverse(initial_ranges, &analyzer);
+    });
 
 TVM_REGISTER_GLOBAL("tir.IndexMapMapNDArray")
     .set_body_typed([](IndexMap map, runtime::NDArray arr) { return map->MapNDArray(arr); });
 
 TVM_REGISTER_GLOBAL("tir.IndexMapNonSurjectiveInverse")
     .set_body_typed([](IndexMap forward, Array<Range> initial_ranges) {
-      auto result = forward.NonSurjectiveInverse(initial_ranges);
+      arith::Analyzer analyzer;
+      auto result = forward.NonSurjectiveInverse(initial_ranges, &analyzer);
       return Array<ObjectRef>{result.first, result.second};
     });
 

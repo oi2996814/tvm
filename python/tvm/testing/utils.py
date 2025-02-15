@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# pylint: disable=invalid-name,unnecessary-comprehension
+# pylint: disable=invalid-name,unnecessary-comprehension,redefined-outer-name
 """TVM testing utilities
 
 Organization
@@ -77,7 +77,6 @@ import sys
 import textwrap
 import time
 import shutil
-import subprocess
 
 from pathlib import Path
 from typing import Optional, Callable, Union, List, Tuple
@@ -91,10 +90,13 @@ import tvm.tir
 import tvm.te
 import tvm._ffi
 
-from tvm.contrib import nvcc, cudnn
+from tvm import relay
+from tvm.target import codegen
+from tvm.contrib import nvcc, cudnn, rocm, graph_executor
 import tvm.contrib.hexagon._ci_env_check as hexagon
 from tvm.driver.tvmc.frontends import load_model
 from tvm.error import TVMError
+import tvm.contrib.utils
 
 
 SKIP_SLOW_TESTS = os.getenv("SKIP_SLOW_TESTS", "").lower() in {"true", "1", "yes"}
@@ -527,7 +529,6 @@ def enabled_targets():
 
 
 class Feature:
-
     """A feature that may be required to run a test.
 
     Parameters
@@ -832,6 +833,16 @@ def _any_gpu_exists():
     )
 
 
+def _multi_gpu_exists():
+    return (
+        (tvm.cuda(0).exist and tvm.cuda(1).exist)
+        or (tvm.rocm(0).exist and tvm.rocm(1).exist)
+        or (tvm.opencl(0).exist and tvm.opencl(1).exist)
+        or (tvm.metal(0).exist and tvm.metal(1).exist)
+        or (tvm.vulkan(0).exist and tvm.vulkan(1).exist)
+    )
+
+
 # Mark a test as requiring llvm to run
 requires_llvm = Feature(
     "llvm", "LLVM", cmake_flag="USE_LLVM", target_kind_enabled="llvm", target_kind_hardware="llvm"
@@ -847,9 +858,24 @@ requires_gpu = Feature("gpu", run_time_check=_any_gpu_exists)
 # :py:func:`tvm.testing.requires_gpu`.
 uses_gpu = requires_gpu(support_required="optional")
 
+# Mark a test as requiring multiple GPUs to run.
+requires_multi_gpu = Feature("multi_gpu", run_time_check=_multi_gpu_exists)
+
+# Mark to differentiate tests that use multiple GPUs in some capacity.
+#
+# These tests will be run on test nodes with multiple GPUs.
+# To mark a test that must have multiple GPUs present to run, use
+# :py:func:`tvm.testing.requires_multi_gpu`.
+uses_multi_gpu = requires_multi_gpu(support_required="optional")
+
 # Mark a test as requiring the x86 Architecture to run.
 requires_x86 = Feature(
     "x86", "x86 Architecture", run_time_check=lambda: platform.machine() == "x86_64"
+)
+
+# Mark a test as requiring the aarch64 Architecture to run.
+requires_aarch64 = Feature(
+    "AArch64", "AArch64 Architecture", run_time_check=lambda: platform.machine() == "aarch64"
 )
 
 # Mark a test as requiring the CUDA runtime.
@@ -876,6 +902,9 @@ requires_cudnn = Feature("cudnn", "cuDNN", cmake_flag="USE_CUDNN", parent_featur
 # Mark a test as requiring the cuBLAS library.
 requires_cublas = Feature("cublas", "cuBLAS", cmake_flag="USE_CUBLAS", parent_features="cuda")
 
+# Mark a test as requiring NCCL support
+requires_nccl = Feature("nccl", "NCCL", cmake_flag="USE_NCCL", parent_features="cuda")
+
 # Mark a test as requiring the NVPTX compilation on the CUDA runtime
 requires_nvptx = Feature(
     "nvptx",
@@ -900,8 +929,8 @@ requires_opencl = Feature(
     "OpenCL",
     cmake_flag="USE_OPENCL",
     target_kind_enabled="opencl",
-    target_kind_hardware="opencl",
-    parent_features="gpu",
+    target_kind_hardware="opencl" if "RPC_TARGET" not in os.environ else None,
+    parent_features="gpu" if "RPC_TARGET" not in os.environ else None,
 )
 
 # Mark a test as requiring the rocm runtime
@@ -913,6 +942,17 @@ requires_rocm = Feature(
     target_kind_hardware="rocm",
     parent_features="gpu",
 )
+
+# Mark a test as requiring a matrixcore to run
+requires_matrixcore = Feature(
+    "matrixcore",
+    "AMD Matrix Core",
+    run_time_check=lambda: tvm.rocm().exist and rocm.have_matrixcore(tvm.rocm().compute_version),
+    parent_features="rocm",
+)
+
+# Mark a test as requiring the hipBLAS library.
+requires_hipblas = Feature("hipblas", "hipBLAS", cmake_flag="USE_HIPBLAS", parent_features="rocm")
 
 # Mark a test as requiring the metal runtime
 requires_metal = Feature(
@@ -934,8 +974,20 @@ requires_vulkan = Feature(
     parent_features="gpu",
 )
 
-# Mark a test as requiring microTVM to run
-requires_micro = Feature("micro", "MicroTVM", cmake_flag="USE_MICRO")
+# Mark a test as requiring OpenCLML support in build.
+requires_openclml = Feature(
+    "OpenCLML",
+    "CLML",
+    cmake_flag="USE_CLML",
+    target_kind_enabled="opencl",
+)
+
+# Mark a test as requiring NNAPI support in build.
+requires_nnapi = Feature(
+    "NNAPI",
+    "NNAPI",
+    cmake_flag="USE_NNAPI_CODEGEN",
+)
 
 # Mark a test as requiring CUTLASS to run
 requires_cutlass = Feature("cutlass", "CUTLASS", cmake_flag="USE_CUTLASS")
@@ -943,11 +995,11 @@ requires_cutlass = Feature("cutlass", "CUTLASS", cmake_flag="USE_CUTLASS")
 # Mark a test as requiring rpc to run
 requires_rpc = Feature("rpc", "RPC", cmake_flag="USE_RPC")
 
-# Mark a test as requiring Arm(R) Ethos(TM)-N to run
-requires_ethosn = Feature("ethosn", "Arm(R) Ethos(TM)-N", cmake_flag="USE_ETHOSN")
-
 # Mark a test as requiring libtorch to run
 requires_libtorch = Feature("libtorch", "LibTorch", cmake_flag="USE_LIBTORCH")
+
+# Mark a test as requiring the MRVL Library
+requires_mrvl = Feature("mrvl", "Marvell", cmake_flag="USE_MRVL")
 
 # Mark a test as requiring Hexagon to run
 requires_hexagon = Feature(
@@ -960,69 +1012,81 @@ requires_hexagon = Feature(
     parent_features="llvm",
 )
 
-# Mark a test as requiring the CMSIS NN library
-requires_cmsisnn = Feature("cmsisnn", "CMSIS NN", cmake_flag="USE_CMSISNN")
 
-
-def _corstone300_compile_time_check():
-    if shutil.which("arm-none-eabi-gcc") is None:
-        return "ARM embedded toolchain unavailable"
+def _aprofile_aem_fvp_compile_time_check():
+    if shutil.which("FVP_Base_RevC-2xAEMvA") is None:
+        return "AProfile AEM is not available"
     return True
 
 
-# Mark a test as requiring the corstone300 FVP
-requires_corstone300 = Feature(
-    "corstone300",
-    "Corstone-300",
-    compile_time_check=_corstone300_compile_time_check,
-    parent_features="cmsisnn",
+requires_aprofile_aem_fvp = Feature(
+    "aprofile-aem-fvp",
+    "AProfile AEM FVP",
+    compile_time_check=_aprofile_aem_fvp_compile_time_check,
 )
 
 # Mark a test as requiring Vitis AI to run
 requires_vitis_ai = Feature("vitis_ai", "Vitis AI", cmake_flag="USE_VITIS_AI")
 
 
-def _arm_dot_supported():
-    arch = platform.machine()
+# check cpu features
+def _has_cpu_feat(features):
+    cpu = codegen.llvm_get_system_cpu()
+    triple = codegen.llvm_get_system_triple()
+    target = "llvm -mtriple=%s -mcpu=%s" % (triple, cpu)
+    has_feat = codegen.target_has_features(features, tvm.target.Target(target))
 
-    if arch not in ["arm64", "aarch64"]:
-        return False
-
-    if sys.platform.startswith("darwin"):
-        cpu_info = subprocess.check_output("sysctl -a", shell=True).strip().decode()
-        for line in cpu_info.split("\n"):
-            if line.startswith("hw.optional.arm.FEAT_DotProd"):
-                return bool(int(line.split(":", 1)[1]))
-    elif sys.platform.startswith("linux"):
-        return True
-
-    return False
+    return has_feat
 
 
-def _is_intel():
-    # Only linux is supported for now.
-    if sys.platform.startswith("linux"):
-        with open("/proc/cpuinfo", "r") as content:
-            return "Intel" in content.read()
-
-    return False
+requires_arm_dot = Feature(
+    "arm_dot",
+    "ARM dot product",
+    run_time_check=lambda: _has_cpu_feat("dotprod"),
+)
 
 
-def _has_vnni():
-    arch = platform.machine()
-    # Only linux is supported for now.
-    if arch == "x86_64" and sys.platform.startswith("linux"):
-        with open("/proc/cpuinfo", "r") as content:
-            return "avx512_vnni" in content.read()
-
-    return False
+requires_arm_fp16 = Feature(
+    "arm_fp16",
+    "Arm(R) Neon(TM) instructions for FP16",
+    run_time_check=lambda: _has_cpu_feat("fullfp16"),
+)
 
 
-requires_arm_dot = Feature("arm_dot", "ARM dot product", run_time_check=_arm_dot_supported)
+requires_aarch64_sve = Feature(
+    "arm_sve",
+    "AArch64 SVE",
+    run_time_check=lambda: _has_cpu_feat("sve"),
+)
 
 
-requires_cascadelake = Feature(
-    "cascadelake", "x86 CascadeLake", run_time_check=lambda: _has_vnni() and _is_intel()
+requires_aarch64_sme = Feature(
+    "arm_sme",
+    "AArch64 SME",
+    run_time_check=lambda: _has_cpu_feat("sme"),
+)
+
+
+requires_x86_vnni = Feature(
+    "x86_vnni",
+    "x86 VNNI Extensions",
+    run_time_check=lambda: (_has_cpu_feat("avx512vnni") or _has_cpu_feat("avxvnni")),
+)
+
+
+requires_x86_avx512 = Feature(
+    "x86_avx512",
+    "x86 AVX512 Extensions",
+    run_time_check=lambda: _has_cpu_feat(
+        ["avx512bw", "avx512cd", "avx512dq", "avx512vl", "avx512f"]
+    ),
+)
+
+
+requires_x86_amx = Feature(
+    "x86_amx",
+    "x86 AMX Extensions",
+    run_time_check=lambda: _has_cpu_feat("amx-int8"),
 )
 
 
@@ -1157,6 +1221,10 @@ def skip_if_32bit(reason):
     return decorator
 
 
+def skip_if_no_reference_system(func):
+    return skip_if_32bit(reason="Reference system unavailable in i386 container")(func)
+
+
 def requires_package(*packages):
     """Mark a test as requiring python packages to run.
 
@@ -1201,7 +1269,6 @@ def requires_package(*packages):
 
 
 def parametrize_targets(*args):
-
     """Parametrize a test over a specific set of targets.
 
     Use this decorator when you want your test to be run over a
@@ -1400,7 +1467,7 @@ def parameter(*values, ids=None, by_dict=None):
 
     # Optional cls parameter in case a parameter is defined inside a
     # class scope.
-    @pytest.fixture(params=values, ids=ids)
+    @pytest.fixture(params=values, ids=ids, scope="session")
     def as_fixture(*_cls, request):
         return request.param
 
@@ -1465,7 +1532,6 @@ def parameters(*value_sets, ids=None):
 
     outputs = []
     for param_values in zip(*value_sets):
-
         # Optional cls parameter in case a parameter is defined inside a
         # class scope.
         def fixture_func(*_cls, request):
@@ -1552,6 +1618,64 @@ def fixture(func=None, *, cache_return_value=False):
     return wraps(func)
 
 
+def get_dtype_range(dtype: str) -> Tuple[int, int]:
+    """
+    Produces the min,max for a give data type.
+
+    Parameters
+    ----------
+    dtype : str
+        a type string (e.g., int8, float64)
+
+    Returns
+    -------
+    type_info.min : int
+        the minimum of the range
+    type_info.max : int
+        the maximum of the range
+    """
+    type_info = None
+    np_dtype = np.dtype(dtype)
+    kind = np_dtype.kind
+
+    if kind == "f":
+        type_info = np.finfo(np_dtype)
+    elif kind in ["i", "u"]:
+        type_info = np.iinfo(np_dtype)
+    else:
+        raise TypeError(f"dtype ({dtype}) must indicate some floating-point or integral data type.")
+    return type_info.min, type_info.max
+
+
+def generate_ref_data(mod, input_data, params=None, target="llvm"):
+    """Generate reference data through executing the relay module"""
+    with tvm.transform.PassContext(opt_level=3, config={"tir.disable_vectorize": True}):
+        lib = relay.build(mod, target=target, params=params)
+
+    lib_name = "mod.so"
+    temp = tvm.contrib.utils.tempdir()
+    lib_path = temp.relpath(lib_name)
+    lib.export_library(lib_path)
+    lib = tvm.runtime.load_module(lib_path)
+    grt_mod = graph_executor.GraphModule(lib["default"](tvm.cpu()))
+    grt_mod.set_input(**input_data)
+    grt_mod.run()
+    output_count = grt_mod.get_num_outputs()
+    out = [grt_mod.get_output(i).numpy() for i in range(output_count)]
+    if isinstance(mod, tvm.relay.Function):
+        main = mod
+    else:
+        main = mod["main"]
+    if "output_tensor_names" in main.attrs:
+        output_tensor_names = main.attrs["output_tensor_names"]
+    else:
+        output_tensor_names = (
+            ["output"] if output_count == 1 else [f"output{i}" for i in range(output_count)]
+        )
+
+    return dict(zip(output_tensor_names, out))
+
+
 class _DeepCopyAllowedClasses(dict):
     def __init__(self, allowed_class_list):
         self.allowed_class_list = allowed_class_list
@@ -1626,7 +1750,7 @@ def _fixture_cache(func):
         try:
             hash((args, kwargs))
             return (args, kwargs)
-        except TypeError as e:
+        except TypeError:
             pass
 
         try:
@@ -1723,7 +1847,7 @@ def install_request_hook(depth: int) -> None:
         base = __file__
         msg += f"found file {__file__}\n"
     except NameError:
-        msg += f"no file\n"
+        msg += "no file\n"
 
     if base is None:
         hook_script_dir = Path.cwd().resolve()
@@ -1831,6 +1955,21 @@ def skip_parameterizations(*skip_params, reason):
     return _mark_parameterizations(*skip_params, marker_fn=pytest.skip, reason=reason)
 
 
+def strtobool(val):
+    """Convert a string representation of truth to true (1) or false (0).
+    True values are 'y', 'yes', 't', 'true', 'on', and '1'; false values
+    are 'n', 'no', 'f', 'false', 'off', and '0'.  Raises ValueError if
+    'val' is anything else.
+    """
+    val = val.lower()
+    if val in ("y", "yes", "t", "true", "on", "1"):
+        return 1
+    elif val in ("n", "no", "f", "false", "off", "0"):
+        return 0
+    else:
+        raise ValueError(f"invalid truth value {val!r}")
+
+
 def main():
     test_file = inspect.getsourcefile(sys._getframe(1))
     sys.exit(pytest.main([test_file] + sys.argv[1:]))
@@ -1843,7 +1982,7 @@ class CompareBeforeAfter:
     input, apply a transformation, then either compare against an
     expected output or assert that the transformation raised an error.
     A test should subclass CompareBeforeAfter, defining class members
-    `before`, `transform`, and `expected`.  CompareBeforeAfter will
+    `before` / `Before`, `transform`, and `expected` / `Expected`.  CompareBeforeAfter will
     then use these members to define a test method and test fixture.
 
     `transform` may be one of the following.
@@ -1854,7 +1993,7 @@ class CompareBeforeAfter:
 
     - A pytest fixture that returns a `tvm.ir.transform.Pass`
 
-    `before` may be any one of the following.
+    `before` / `Before` may be any one of the following.
 
     - An instance of `tvm.tir.PrimFunc`.  This is allowed, but is not
       the preferred method, as any errors in constructing the
@@ -1869,13 +2008,13 @@ class CompareBeforeAfter:
 
     - A pytest fixture that returns a `tvm.tir.PrimFunc`
 
-    `expected` may be any one of the following.  The type of
-    `expected` defines the test being performed.  If `expected`
+    `expected` / `Expected` may be any one of the following.  The type of
+    `expected` / `Expected` defines the test being performed.  If `expected`
     provides a `tvm.tir.PrimFunc`, the result of the transformation
     must match `expected`.  If `expected` is an exception, then the
     transformation must raise that exception type.
 
-    - Any option supported for `before`.
+    - Any option supported for `before` / `Before`.
 
     - The `Exception` class object, or a class object that inherits
       from `Exception`.
@@ -1894,28 +2033,39 @@ class CompareBeforeAfter:
         class TestRemoveIf(tvm.testing.CompareBeforeAfter):
             transform = tvm.tir.transform.Simplify()
 
-            def before(A: T.Buffer[1, "int32"]):
+            def before(A: T.Buffer(1, "int32")):
                 if True:
                     A[0] = 42
                 else:
                     A[0] = 5
 
-            def expected(A: T.Buffer[1, "int32"]):
+            def expected(A: T.Buffer(1, "int32")):
                 A[0] = 42
 
     """
 
+    check_well_formed: bool = True
+
     def __init_subclass__(cls):
-        if hasattr(cls, "before"):
-            cls.before = cls._normalize_before(cls.before)
-        if hasattr(cls, "expected"):
-            cls.expected = cls._normalize_expected(cls.expected)
+        assert len([getattr(cls, name) for name in ["before", "Before"] if hasattr(cls, name)]) <= 1
+        assert (
+            len([getattr(cls, name) for name in ["expected", "Expected"] if hasattr(cls, name)])
+            <= 1
+        )
+        for name in ["before", "Before"]:
+            if hasattr(cls, name):
+                cls.before = cls._normalize_before(getattr(cls, name))
+                break
+        for name in ["expected", "Expected"]:
+            if hasattr(cls, name):
+                cls.expected = cls._normalize_expected(getattr(cls, name))
+                break
         if hasattr(cls, "transform"):
             cls.transform = cls._normalize_transform(cls.transform)
 
     @classmethod
     def _normalize_ir_module(cls, func):
-        if isinstance(func, tvm.tir.PrimFunc):
+        if isinstance(func, (tvm.tir.PrimFunc, tvm.IRModule)):
 
             def inner(self):
                 # pylint: disable=unused-argument
@@ -1936,11 +2086,13 @@ class CompareBeforeAfter:
                     if name.startswith("_"):
                         pass
                     elif isinstance(method, tvm.ir.function.BaseFunc):
-                        func_dict[name] = method
+                        func_dict[name] = method.with_attr("global_symbol", name)
                     else:
                         source_code = "@T.prim_func\n" + textwrap.dedent(inspect.getsource(method))
-                        prim_func = tvm.script.from_source(source_code)
-                        func_dict[name] = prim_func
+                        prim_func = tvm.script.from_source(
+                            source_code, check_well_formed=self.check_well_formed
+                        )
+                        func_dict[name] = prim_func.with_attr("global_symbol", name)
                 return tvm.IRModule(func_dict)
 
         else:
@@ -1948,7 +2100,7 @@ class CompareBeforeAfter:
             def inner(self):
                 # pylint: disable=unused-argument
                 source_code = "@T.prim_func\n" + textwrap.dedent(inspect.getsource(func))
-                return tvm.script.from_source(source_code)
+                return tvm.script.from_source(source_code, check_well_formed=self.check_well_formed)
 
         return pytest.fixture(inner)
 
@@ -1991,7 +2143,6 @@ class CompareBeforeAfter:
             return inner
 
         if hasattr(transform, "_pytestfixturefunction"):
-
             if not hasattr(cls, "_transform_orig"):
                 cls._transform_orig = transform
 
@@ -2012,7 +2163,6 @@ class CompareBeforeAfter:
                 return apply(transform(self))
 
         else:
-
             raise TypeError(
                 "Expected transform to be a tvm.ir.transform.Pass, or a method returning a Pass"
             )
@@ -2021,18 +2171,10 @@ class CompareBeforeAfter:
 
     @staticmethod
     def _is_method(func):
-        sig = inspect.signature(func)
-        return "self" in sig.parameters
+        return callable(func) and "self" in inspect.signature(func).parameters
 
     def test_compare(self, before, expected, transform):
         """Unit test to compare the expected TIR PrimFunc to actual"""
-
-        def pprint(name, obj):
-            script = obj.script()
-            if isinstance(obj, tvm.IRModule):
-                return script.replace("class Module", f"class {name}")
-            else:
-                return script.replace("def func", f"def {name}")
 
         if inspect.isclass(expected) and issubclass(expected, Exception):
             with pytest.raises(expected):
@@ -2041,8 +2183,8 @@ class CompareBeforeAfter:
                 # This portion through pytest.fail isn't strictly
                 # necessary, but gives a better error message that
                 # includes the before/after.
-                before_str = pprint("before", before)
-                after_str = pprint("after", after)
+                before_str = before.script(name="before")
+                after_str = after.script(name="after")
 
                 pytest.fail(
                     msg=(
@@ -2055,11 +2197,15 @@ class CompareBeforeAfter:
             after = transform(before)
 
             try:
+                # overwrite global symbol so it doesn't come up in the comparison
+                if isinstance(after, tvm.tir.PrimFunc):
+                    after = after.with_attr("global_symbol", "main")
+                    expected = expected.with_attr("global_symbol", "main")
                 tvm.ir.assert_structural_equal(after, expected)
             except ValueError as err:
-                before_str = pprint("before", before)
-                after_str = pprint("after", after)
-                expected_str = pprint("expected", expected)
+                before_str = before.script(name="before")
+                after_str = after.script(name="after")
+                expected_str = expected.script(name="expected")
                 raise ValueError(
                     f"TIR after transformation did not match expected:\n"
                     f"{before_str}\n{after_str}\n{expected_str}"
@@ -2072,3 +2218,25 @@ class CompareBeforeAfter:
                 f"or an instance of `tvm.tir.PrimFunc`.  "
                 f"Instead, received {type(expected)}."
             )
+
+
+class _control_span_filling:
+    def __init__(self, on=True):
+        self._on = on
+        self._pass_ctx = tvm.transform.PassContext(config={"relay.frontend.fill_span": self._on})
+
+    def __enter__(self):
+        self._pass_ctx.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._pass_ctx.__exit__(exc_type, exc_val, exc_tb)
+
+
+class enable_span_filling(_control_span_filling):
+    def __init__(self):
+        super().__init__()
+
+
+class disable_span_filling(_control_span_filling):
+    def __init__(self):
+        super().__init__(on=False)

@@ -27,6 +27,7 @@
 
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/ndarray.h>
+#include <tvm/runtime/profiling.h>
 
 #include <cstddef>
 #include <string>
@@ -58,11 +59,35 @@ class JSONRuntimeBase : public ModuleNode {
 
   const char* type_key() const override { return "json"; }  // May be overridden
 
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const override {
+    return ModulePropertyMask::kBinarySerializable | ModulePropertyMask::kRunnable;
+  }
+
   /*! \brief Initialize a specific json runtime. */
   virtual void Init(const Array<NDArray>& consts) = 0;
 
   /*! \brief Invoke the execution engine to inteprete a specific json runtime. */
   virtual void Run() = 0;
+
+  /*! \brief Does the backend support debug & profiling */
+  virtual bool CanDebug() { return false; }
+
+  /*!
+   * \brief Invoke the profiler
+   * \param pointer to profiler
+   */
+  virtual void RunProfile(profiling::Profiler* prof) {
+    LOG(FATAL) << "Not expected to be here : Profiling call w/o support ?";
+  }
+
+  /*!
+   * \brief Invoke the debugger
+   * \return External compiler specific debug blob
+   */
+  virtual std::string DebugDump(void) {
+    LOG(FATAL) << "Not expected to be here : Debug dump w/o support ?";
+  }
 
   /*!
    * \brief Get a packed function.
@@ -70,7 +95,7 @@ class JSONRuntimeBase : public ModuleNode {
    * \param sptr_to_self The pointer to the module node.
    * \return The packed function.
    */
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) override {
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) override {
     if (name == "get_symbol") {
       return PackedFunc(
           [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->symbol_name_; });
@@ -83,8 +108,31 @@ class JSONRuntimeBase : public ModuleNode {
 
         // Bind argument tensors to data entries.
         this->SetInputOutputBuffers(args);
+
         // Execute the subgraph.
         this->Run();
+      });
+    } else if (this->symbol_name_ + "_debug" == name) {
+      if (!this->CanDebug()) {
+        return PackedFunc(nullptr);
+      }
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        ICHECK(this->initialized_) << "The module has not been initialized";
+
+        // Bind argument tensors to data entries.
+        this->SetInputOutputBuffers(args);
+
+        if (rv->IsObjectRef<String>()) {
+          String purpose = *rv;
+          if ("debug_dump" == purpose) {
+            *rv = this->DebugDump();
+          }
+        } else {
+          // Profile the subgraph.
+          profiling::Profiler* prof = static_cast<profiling::Profiler*>(rv->value().v_handle);
+          this->RunProfile(prof);
+        }
+        // String vendor_prof = this->RunProfile(prof);
       });
     } else if ("__init_" + this->symbol_name_ == name) {
       // The function to initialize constant tensors.
@@ -140,7 +188,7 @@ class JSONRuntimeBase : public ModuleNode {
    * \param format the format to return.
    * \return A string of JSON.
    */
-  std::string GetSource(const std::string& format = "json") override { return graph_json_; }
+  String GetSource(const String& format = "json") override { return graph_json_; }
 
  protected:
   /*!
@@ -228,6 +276,7 @@ class JSONRuntimeBase : public ModuleNode {
   void Load(dmlc::JSONReader* reader) {
     reader->BeginObject();
     std::string key;
+    std::string symbol_;
     while (reader->NextObjectItem(&key)) {
       if (key == "nodes") {
         reader->Read(&nodes_);
@@ -237,6 +286,8 @@ class JSONRuntimeBase : public ModuleNode {
         reader->Read(&node_row_ptr_);
       } else if (key == "heads") {
         reader->Read(&outputs_);
+      } else if (key == "symbol") {
+        reader->Read(&symbol_);
       } else {
         LOG(FATAL) << "Unknown key: " << key;
       }

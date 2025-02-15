@@ -24,13 +24,14 @@
 #ifndef TVM_IR_EXPR_H_
 #define TVM_IR_EXPR_H_
 
-#include <tvm/ir/span.h>
+#include <tvm/ir/source_map.h>
 #include <tvm/ir/type.h>
 #include <tvm/node/node.h>
 #include <tvm/runtime/container/string.h>
 #include <tvm/runtime/object.h>
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -99,6 +100,8 @@ class PrimExprNode : public BaseExprNode {
    * a more fine-grained Type, and we can get the type by running lazy type inference.
    */
   DataType dtype;
+
+  TVM_OBJECT_ENABLE_SCRIPT_PRINTER();
 
   static constexpr const char* _type_key = "PrimExpr";
   static constexpr const uint32_t _type_child_slots = 38;
@@ -365,6 +368,14 @@ class RelayExprNode : public BaseExprNode {
    *       This value is discarded during serialization.
    */
   mutable Type checked_type_ = Type(nullptr);
+
+  /*!
+   * \brief Stores the result of structure information of the
+   *        expression that encapsulate both static shape and
+   *        runtime information such as shape.
+   */
+  mutable Optional<ObjectRef> struct_info_ = Optional<ObjectRef>();
+
   /*!
    * \return The checked_type
    */
@@ -452,6 +463,7 @@ class GlobalVarNode : public RelayExprNode {
     v->Visit("virtual_device_", &virtual_device_);
     v->Visit("span", &span);
     v->Visit("_checked_type_", &checked_type_);
+    v->Visit("struct_info_", &struct_info_);
   }
 
   bool SEqualReduce(const GlobalVarNode* other, SEqualReducer equal) const {
@@ -526,6 +538,7 @@ class IntImm : public PrimExpr {
   TVM_DLL IntImm(DataType dtype, int64_t value, Span span = Span());
 
   TVM_DEFINE_OBJECT_REF_METHODS(IntImm, PrimExpr, IntImmNode);
+  TVM_DEFINE_OBJECT_REF_COW_METHOD(IntImmNode);
 };
 
 /*!
@@ -572,6 +585,7 @@ class FloatImm : public PrimExpr {
   TVM_DLL FloatImm(DataType dtype, double value, Span span = Span());
 
   TVM_DEFINE_OBJECT_REF_METHODS(FloatImm, PrimExpr, FloatImmNode);
+  TVM_DEFINE_OBJECT_REF_COW_METHOD(FloatImmNode);
 };
 
 /*!
@@ -707,7 +721,7 @@ class RangeNode : public Object {
   TVM_DECLARE_FINAL_OBJECT_INFO(RangeNode, Object);
 };
 
-/*! \brief Range constainer  */
+/*! \brief Range container  */
 class Range : public ObjectRef {
  public:
   /*!
@@ -732,7 +746,7 @@ class Range : public ObjectRef {
   TVM_DEFINE_OBJECT_REF_METHODS(Range, ObjectRef, RangeNode);
 };
 
-// implementataions
+// implementations
 inline const Type& RelayExprNode::checked_type() const {
   ICHECK(checked_type_.defined()) << "internal error: the type checker has "
                                   << "not populated the checked_type "
@@ -756,52 +770,152 @@ inline const TTypeNode* RelayExprNode::type_as() const {
 
 namespace tvm {
 namespace runtime {
-// common rule for RetValue and ArgValue
-template <>
-struct PackedFuncValueConverter<PrimExpr> {
-  static PrimExpr From(const TVMPODValue_& val) {
-    if (val.type_code() == kTVMNullptr) {
-      return PrimExpr(ObjectPtr<Object>(nullptr));
-    }
-    if (val.type_code() == kDLInt) {
-      return IntImm(runtime::DataType::Int(32), val.operator int());
-    }
-    if (val.type_code() == kDLFloat) {
-      return FloatImm(runtime::DataType::Float(32), val.operator double());
-    }
 
-    return PrimExpr::FromObject_(val.AsObjectRef<ObjectRef>());
+// Automatic conversion into IntImm, Integer, and Bool, when called
+// through the FFI.  Automatic conversions into PrimExpr are
+// registered in "tvm/tir/expr.h", as it includes conversions to the
+// TIR-only StringImm.
+//
+// While the FFI only requires the From() method, these
+// implementations also define a TryFrom() method to avoid duplicate
+// logic in the PrimExpr conversion.
+
+template <>
+struct PackedFuncValueConverter<tvm::IntImm> {
+  template <typename PODSubclass>
+  static Optional<tvm::IntImm> TryFrom(const PODSubclass& val) {
+    if (auto opt = val.TryAsInt()) {
+      int64_t value = opt.value();
+      auto dtype =
+          (value > std::numeric_limits<int>::max() || value < std::numeric_limits<int>::min())
+              ? DataType::Int(64)
+              : DataType::Int(32);
+      return IntImm(dtype, value);
+    } else if (auto opt = val.TryAsBool()) {
+      return IntImm(DataType::Int(32), opt.value());
+    } else {
+      return NullOpt;
+    }
+  }
+
+  template <typename PODSubclass>
+  static tvm::IntImm From(const PODSubclass& val) {
+    if (auto opt = TryFrom(val)) {
+      return opt.value();
+    } else {
+      return val.template AsObjectRef<tvm::IntImm>();
+    }
   }
 };
 
 template <>
 struct PackedFuncValueConverter<tvm::Integer> {
-  static tvm::Integer From(const TVMPODValue_& val) {
-    if (val.type_code() == kTVMNullptr) {
-      return Integer(ObjectPtr<Object>(nullptr));
+  template <typename PODSubclass>
+  static tvm::Integer From(const PODSubclass& val) {
+    if (auto opt = PackedFuncValueConverter<tvm::IntImm>::TryFrom(val)) {
+      return Integer(opt.value());
+    } else {
+      return val.template AsObjectRef<tvm::Integer>();
     }
-    if (val.type_code() == kTVMArgInt) {
-      return Integer(val.operator int());
-    }
-    return val.AsObjectRef<tvm::Integer>();
   }
 };
 
 template <>
 struct PackedFuncValueConverter<tvm::Bool> {
-  static tvm::Bool From(const TVMPODValue_& val) {
-    if (val.type_code() == kTVMNullptr) {
-      return Bool(ObjectPtr<Object>(nullptr));
+  template <typename PODSubclass>
+  static Optional<tvm::Bool> TryFrom(const PODSubclass& val) {
+    if (auto opt = val.TryAsBool()) {
+      return tvm::Bool(opt.value());
+    } else if (auto opt = val.TryAsInt()) {
+      int value = opt.value();
+      ICHECK(value == 0 || value == 1)
+          << "ValueError: boolean value can only be 0 or 1, but get " << value;
+      return tvm::Bool(static_cast<bool>(value));
+    } else {
+      return NullOpt;
     }
-    if (val.type_code() == kTVMArgInt) {
-      int v = val.operator int();
-      ICHECK(v == 0 || v == 1) << "ValueError: boolean value can only be 0 or 1, but get " << v;
-      return Bool(static_cast<bool>(v));
+  }
+
+  template <typename PODSubclass>
+  static tvm::Bool From(const PODSubclass& val) {
+    if (auto opt = TryFrom(val)) {
+      return opt.value();
+    } else {
+      return val.template AsObjectRef<tvm::Bool>();
     }
-    return val.AsObjectRef<tvm::Bool>();
+  }
+};
+
+template <>
+struct PackedFuncValueConverter<tvm::FloatImm> {
+  static Optional<tvm::FloatImm> TryFrom(const TVMPODValue_& val) {
+    if (auto opt = val.TryAsFloat()) {
+      return FloatImm(runtime::DataType::Float(32), opt.value());
+    } else {
+      return NullOpt;
+    }
+  }
+
+  template <typename PODSubclass>
+  static tvm::FloatImm From(const PODSubclass& val) {
+    if (auto opt = TryFrom(val)) {
+      return opt.value();
+    } else {
+      return val.template AsObjectRef<tvm::FloatImm>();
+    }
+  }
+};
+
+/* \brief Backwards compatibility wrapper for IntImm arguments
+ *
+ * In previous versions of TVM, IntImm was the default FFI type for
+ * integer arguments, instead of runtime::Int.  For backwards
+ * compatibility where the callee has been updated to expected a
+ * runtime::Int, the caller has not been updated to provide a
+ * runtime::Int (e.g. relay script parsing), and the auto-unboxing of
+ * runtime::Int does not apply (e.g. making an `Array<runtime::Int>`),
+ * allow the IntImm to be generated.
+ */
+template <>
+struct PackedFuncValueConverter<runtime::Int> {
+  template <typename PODSubclass>
+  static runtime::Int From(const PODSubclass& val) {
+    if (val.template IsObjectRef<tvm::IntImm>()) {
+      return runtime::Int(val.template AsObjectRef<tvm::IntImm>()->value);
+    } else {
+      return val.template AsObjectRef<runtime::Int>();
+    }
   }
 };
 
 }  // namespace runtime
 }  // namespace tvm
+
+/* \brief Allow tvm.GLobalVar as key in STL tables
+ *
+ * For most IR expressions, it would be ambiguous whether the
+ * expression should follow reference equality or structural equality.
+ * This is not the case for variables, which do not contain nested
+ * internal structure, and are frequently used as keys in lookup
+ * tables.
+ *
+ * Providing `std::hash` and `std::equal_to` specializations for
+ * `tvm::GlobalVar` allows it to be used as a key in STL tables.  For
+ * other IR expressions, the user must specify the type of equality
+ * used (e.g. `std::unordered_set<T, StructuralHash, StructuralEqual>`
+ * or `std::unordered_set<T, ObjectPtrHash, ObjectPtrEqual>`).
+ */
+template <>
+struct std::hash<tvm::GlobalVar> {
+  std::size_t operator()(const tvm::GlobalVar& var) const {
+    return tvm::runtime::ObjectPtrHash()(var);
+  }
+};
+
+template <>
+struct std::equal_to<tvm::GlobalVar> {
+  bool operator()(const tvm::GlobalVar& var_a, const tvm::GlobalVar& var_b) const {
+    return tvm::runtime::ObjectPtrEqual()(var_a, var_b);
+  }
+};
 #endif  // TVM_IR_EXPR_H_

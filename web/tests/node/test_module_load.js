@@ -24,16 +24,13 @@ const assert = require("assert");
 const tvmjs = require("../../dist");
 
 const wasmPath = tvmjs.wasmPath();
-const EmccWASI = require(path.join(wasmPath, "tvmjs_runtime.wasi.js"));
 const wasmSource = fs.readFileSync(path.join(wasmPath, "test_addone.wasm"));
 
 const tvm = new tvmjs.Instance(
   new WebAssembly.Module(wasmSource),
-  new EmccWASI()
+  tvmjs.createPolyfillWASI()
 );
 
-// Load system library
-const sysLib = tvm.systemLib();
 
 function randomArray(length, max) {
   return Array.apply(null, Array(length)).map(function () {
@@ -42,8 +39,13 @@ function randomArray(length, max) {
 }
 
 test("add one", () => {
+  tvm.beginScope();
+  // Load system library
+  const sysLib = tvm.systemLib();
   // grab pre-loaded function
   const faddOne = sysLib.getFunction("add_one");
+  tvm.detachFromCurrentScope(faddOne);
+
   assert(tvm.isPackedFunc(faddOne));
   const n = 124;
   const A = tvm.empty(n).copyFrom(randomArray(n, 1));
@@ -56,5 +58,13 @@ test("add one", () => {
   for (var i = 0; i < BB.length; ++i) {
     assert(Math.abs(BB[i] - (AA[i] + 1)) < 1e-5);
   }
+  tvm.endScope();
+
+  // assert auto release scope behavior
+  assert(sysLib.getHandle(false) == 0);
+  // fadd is not released because it is detached
+  assert(faddOne._tvmPackedCell.handle != 0);
   faddOne.dispose();
+  assert(A.getHandle(false) == 0);
+  assert(B.getHandle(false) == 0);
 });

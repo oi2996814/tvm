@@ -236,14 +236,18 @@ class TestCropAndResize:
 
         extrapolation_value = 0.0
 
+        np.random.seed(0)
+
+        eps = 1e-4
+
         if layout == "NHWC":
             img_shape = (10, 224, 224, 3)
-            boxes = np.array([[0.1, 0.2, 0.8, 0.7], [0.2, 0, 1, 0.6]]).astype("float32")
+            boxes = np.random.uniform(size=(2, 4)).astype("float32")
             box_indices = np.array([1, 0]).astype("int32")
             crop_size = np.array([20, 30]).astype("int32")
         elif layout == "NCHW":
             img_shape = (5, 3, 255, 255)
-            boxes = np.array([[0, 0, 1, 1], [0.2, 0.1, 1, 0.9]]).astype("float32")
+            boxes = np.random.uniform(size=(2, 4)).astype("float32")
             box_indices = np.array([0, 1]).astype("int32")
             crop_size = np.array([30, 30]).astype("int32")
         else:
@@ -626,7 +630,7 @@ def test_non_max_suppression(executor_kind):
 
 @tvm.testing.uses_gpu
 def test_multibox_transform_loc(executor_kind):
-    def test_default_value():
+    def test_default_value(keep_background):
         num_anchors = 3
         num_classes = 3
 
@@ -640,14 +644,26 @@ def test_multibox_transform_loc(executor_kind):
             [[[-0.1, -0.1, 0.1, 0.1], [-0.2, -0.2, 0.2, 0.2], [1.2, 1.2, 1.5, 1.5]]]
         ).astype("float32")
 
-        expected_np_out = np.array(
-            [
+        expected_np_out = (
+            np.array(
                 [
-                    [1, 0.69999999, 0, 0, 0.10818365, 0.10008108],
-                    [0, 0.44999999, 1, 1, 1, 1],
-                    [0, 0.30000001, 0, 0, 0.22903419, 0.20435292],
+                    [
+                        [2, 0.69999999, 0, 0, 0.10818365, 0.10008108],
+                        [0, 0.49999999, 0, 0, 0.22903419, 0.20435292],
+                        [1, 0.44999999, 1, 1, 1, 1],
+                    ]
                 ]
-            ]
+            )
+            if keep_background
+            else np.array(
+                [
+                    [
+                        [1, 0.69999999, 0, 0, 0.10818365, 0.10008108],
+                        [0, 0.44999999, 1, 1, 1, 1],
+                        [0, 0.30000001, 0, 0, 0.22903419, 0.20435292],
+                    ]
+                ]
+            )
         )
 
         cls_prob = relay.var(
@@ -657,7 +673,7 @@ def test_multibox_transform_loc(executor_kind):
         anchors = relay.var("anchors", relay.ty.TensorType((1, num_anchors, 4), "float32"))
 
         mtl = relay.vision.multibox_transform_loc(
-            cls_prob=cls_prob, loc_pred=loc_pred, anchor=anchors
+            cls_prob=cls_prob, loc_pred=loc_pred, anchor=anchors, keep_background=keep_background
         )
         ret = run_infer_type(mtl.astuple())
         ref_type = relay.ty.TupleType(
@@ -710,7 +726,8 @@ def test_multibox_transform_loc(executor_kind):
         )
         assert ret.checked_type == ref_type
 
-    test_default_value()
+    test_default_value(keep_background=False)
+    test_default_value(keep_background=True)
     test_threshold()
 
 
@@ -1419,8 +1436,9 @@ def test_grid_sample(executor_kind):
 
     data_2D_shape = (4, 4, 8, 8)
     grid_2D_shape = (4, 2, 16, 16)
-    data_3D_shape = (4, 4, 8, 8, 8)
-    grid_3D_shape = (4, 3, 16, 16, 16)
+    # choosing smaller sizes to be testable on weaker GPUs
+    data_3D_shape = (4, 4, 4, 4, 4)
+    grid_3D_shape = (4, 3, 8, 8, 8)
 
     for _method in methods:
         for _padding in padding_modes:

@@ -86,14 +86,13 @@ def conv2d_strategy_hexagon(attrs, inputs, out_type, target):
                 name="depthwise_conv2d_nchw.hexagon",
             )
         elif layout == "NHWC":
-            assert kernel_layout == "HWOI"
             strategy.add_implementation(
-                wrap_compute_conv2d(topi.nn.depthwise_conv2d_nhwc),
+                wrap_compute_conv2d(topi.nn.depthwise_conv2d_nhwc, need_kernel_layout=True),
                 wrap_topi_schedule(topi.hexagon.schedule_depthwise_conv2d_nhwc),
                 name="depthwise_conv2d_nhwc.hexagon",
             )
         else:
-            raise RuntimeError("Unsupported depthwise_conv2d layout {}".format(layout))
+            raise RuntimeError(f"Unsupported depthwise_conv2d layout {layout}")
     else:  # group_conv2d
         raise RuntimeError(f"Unsupported group_conv2d layout {layout}")
 
@@ -140,7 +139,7 @@ def conv2d_transpose_strategy_hexagon(attrs, inputs, out_type, target):
             name="conv2d_transpose_nchw.generic",
         )
     else:
-        raise RuntimeError("Unsupported conv2d_transpose layout {}".format(layout))
+        raise RuntimeError(f"Unsupported conv2d_transpose layout {layout}")
     return strategy
 
 

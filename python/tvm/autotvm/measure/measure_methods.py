@@ -149,10 +149,7 @@ class LocalBuilder(Builder):
                         # instantiation error
                         if isinstance(exception, InstantiationError):
                             res = MeasureResult(
-                                (
-                                    tb,
-                                    exception,
-                                ),
+                                (tb, exception),
                                 MeasureErrorNo.INSTANTIATION_ERROR,
                                 res.time_cost,
                                 time.time(),
@@ -166,10 +163,7 @@ class LocalBuilder(Builder):
                                 except Exception:  # pylint: disable=broad-except
                                     pass
                                 res = MeasureResult(
-                                    (
-                                        tb,
-                                        InstantiationError(msg),
-                                    ),
+                                    (tb, InstantiationError(msg)),
                                     MeasureErrorNo.INSTANTIATION_ERROR,
                                     res.time_cost,
                                     time.time(),
@@ -177,10 +171,7 @@ class LocalBuilder(Builder):
 
                             else:  # tvm error
                                 res = MeasureResult(
-                                    (
-                                        tb,
-                                        res.error,
-                                    ),
+                                    (tb, res.error),
                                     MeasureErrorNo.COMPILE_HOST,
                                     res.time_cost,
                                     time.time(),
@@ -188,24 +179,12 @@ class LocalBuilder(Builder):
                 except TimeoutError as ex:
                     tb = traceback.format_exc()
                     res = MeasureResult(
-                        (
-                            tb,
-                            ex,
-                        ),
-                        MeasureErrorNo.BUILD_TIMEOUT,
-                        self.timeout,
-                        time.time(),
+                        (tb, ex), MeasureErrorNo.BUILD_TIMEOUT, self.timeout, time.time()
                     )
                 except ChildProcessError as ex:
                     tb = traceback.format_exc()
                     res = MeasureResult(
-                        (
-                            tb,
-                            ex,
-                        ),
-                        MeasureErrorNo.RUNTIME_DEVICE,
-                        self.timeout,
-                        time.time(),
+                        (tb, ex), MeasureErrorNo.RUNTIME_DEVICE, self.timeout, time.time()
                     )
 
                 results.append(res)
@@ -330,7 +309,7 @@ class RPCRunner(Runner):
             )
 
     def get_build_kwargs(self):
-        kwargs = {}
+        kwargs = {"checks": {}}
         if (
             "cuda" in self.task.target.keys
             or "opencl" in self.task.target.keys
@@ -340,13 +319,15 @@ class RPCRunner(Runner):
             remote = request_remote(self.key, self.host, self.port)
             dev = remote.device(str(self.task.target), 0)
             max_dims = dev.max_thread_dimensions
-            kwargs["check_gpu"] = {
+            kwargs["checks"]["gpu"] = {
                 "max_shared_memory_per_block": dev.max_shared_memory_per_block,
                 "max_threads_per_block": dev.max_threads_per_block,
                 "max_thread_x": max_dims[0],
                 "max_thread_y": max_dims[1],
                 "max_thread_z": max_dims[2],
             }
+        if "hexagon" in self.task.target.keys:
+            kwargs["checks"]["hexagon"] = {"vtcm_capacity": self.task.target.vtcm_capacity}
 
         return kwargs
 
@@ -393,13 +374,7 @@ class RPCRunner(Runner):
                     tb = traceback.format_exc()
                     results.append(
                         MeasureResult(
-                            (
-                                tb,
-                                ex,
-                            ),
-                            MeasureErrorNo.RUN_TIMEOUT,
-                            self.timeout,
-                            time.time(),
+                            (tb, ex), MeasureErrorNo.RUN_TIMEOUT, self.timeout, time.time()
                         )
                     )
 
@@ -477,7 +452,7 @@ class LocalRunner(RPCRunner):
 
         self.task = task
         tracker = Tracker(port=9000, port_end=10000, silent=True)
-        device_key = "$local$device$%d" % tracker.port
+        device_key = f"$local$device${tracker.port}"
         server = Server(
             port=9000,
             port_end=10000,
@@ -493,11 +468,11 @@ class LocalRunner(RPCRunner):
         return server, tracker
 
 
-def _build_func_common(measure_input, runtime=None, check_gpu=None, build_option=None):
+def _build_func_common(measure_input, runtime=None, checks=None, build_option=None):
     """Common part for building a configuration"""
     target, task, config = measure_input
     target, task.target_host = Target.canon_target_and_host(target, task.target_host)
-
+    checks = checks or {}
     with target:
         s, args = task.instantiate(config)
 
@@ -505,39 +480,29 @@ def _build_func_common(measure_input, runtime=None, check_gpu=None, build_option
         if not config.valid():
             raise InstantiationError(config.errors)
 
-        # if target is vta, we need to use vta build
-        if (
-            hasattr(measure_input.target, "device_name")
-            and measure_input.target.device_name == "vta"
-        ):
-            # pylint: disable=import-outside-toplevel
-            import vta
+        current_pass_context: tvm.ir.transform.PassContext = tvm.ir.transform.PassContext.current()
+        current_config = dict(current_pass_context.config)
+        if build_option is not None:
+            current_config.update(build_option)
 
-            func = vta.build(s, args, target_host=task.target_host)
+        if "tir.add_lower_pass" in current_config:
+            current_add_lower_pass = list(current_config["tir.add_lower_pass"])
         else:
-            current_pass_context: tvm.ir.transform.PassContext = (
-                tvm.ir.transform.PassContext.current()
-            )
-            current_config = dict(current_pass_context.config)
-            if build_option is not None:
-                current_config.update(build_option)
+            current_add_lower_pass = []
+        if checks.get("gpu"):
+            current_add_lower_pass.append((2, gpu_verify_pass(**checks.get("gpu"))))
+        if checks.get("hexagon"):
+            current_add_lower_pass.append((2, vtcm_verify_pass(**checks.get("hexagon"))))
+        current_config["tir.add_lower_pass"] = current_add_lower_pass
 
-            if "tir.add_lower_pass" in current_config:
-                current_add_lower_pass = list(current_config["tir.add_lower_pass"])
-            else:
-                current_add_lower_pass = []
-            if check_gpu:
-                current_add_lower_pass.append((2, gpu_verify_pass(**check_gpu)))
-            current_config["tir.add_lower_pass"] = current_add_lower_pass
-
-            with tvm.ir.transform.PassContext(
-                opt_level=current_pass_context.opt_level,
-                required_pass=current_pass_context.required_pass,
-                disabled_pass=current_pass_context.disabled_pass,
-                instruments=current_pass_context.instruments,
-                config=current_config,
-            ):
-                func = build(s, args, target_host=task.target_host, runtime=runtime)
+        with tvm.ir.transform.PassContext(
+            opt_level=current_pass_context.opt_level,
+            required_pass=current_pass_context.required_pass,
+            disabled_pass=current_pass_context.disabled_pass,
+            instruments=current_pass_context.instruments,
+            config=current_config,
+        ):
+            func = build(s, args, target=target, runtime=runtime)
     return func, tuple((get_const_tuple(x.shape), x.dtype) for x in args)
 
 
@@ -582,19 +547,11 @@ class _WrappedBuildFunc:
         tic = time.time()
         try:
             filename = os.path.join(
-                tmp_dir, "tmp_func_%0x.%s" % (getrandbits(64), self.build_func.output_format)
+                tmp_dir, f"tmp_func_{getrandbits(64):0x}.{self.build_func.output_format}"
             )
             # TODO(tvm-team) consider linline _build_func_common
             func, arg_info = _build_func_common(measure_input, self.runtime, **kwargs)
-            if self.build_func.output_format == ".model-library-format":
-                # Late import to preserve autoTVM with USE_MICRO OFF
-                try:
-                    from tvm import micro  # pylint: disable=import-outside-toplevel
-                except ImportError:
-                    raise ImportError("Requires USE_MICRO")
-                micro.export_model_library_format(func, filename)
-            else:
-                func.export_library(filename, self.build_func)
+            func.export_library(filename, fcompile=self.build_func)
         except Exception as e:  # pylint: disable=broad-except
             tb = traceback.format_exc()
             return BuildResult(None, None, (tb, e), time.time() - tic)
@@ -711,10 +668,7 @@ def run_through_rpc(
             msg = msg[: msg.index("Stack trace returned")]
         if "CUDA Source" in msg:
             msg = msg[: msg.index("CUDA Source")]
-        costs = (
-            traceback.format_exc(),
-            RuntimeError(msg[:1024]),
-        )
+        costs = (traceback.format_exc(), RuntimeError(msg[:1024]))
         errno = MeasureErrorNo.RUNTIME_DEVICE
     tstamp = time.time()
     time.sleep(cooldown_interval)
@@ -830,9 +784,7 @@ def check_remote(target, device_key, host=None, port=None, priority=100, timeout
             pass
         logger.debug("device available")
 
-    t = threading.Thread(
-        target=_check,
-    )
+    t = threading.Thread(target=_check)
     t.start()
     t.join(timeout)
 
@@ -869,6 +821,23 @@ def gpu_verify_pass(**kwargs):
         valid = tvm.tir.analysis.verify_gpu_code(f, kwargs)
         if not valid:
             raise InstantiationError("Skipped because of invalid gpu kernel")
+        return f
+
+    return tvm.tir.transform.prim_func_pass(verify_pass, opt_level=0)
+
+
+def vtcm_verify_pass(**kwargs):
+    """Verify the validity of a hexagon kernel.
+    This pass will check vtcm memory usage.
+    """
+
+    def verify_pass(f, *_):
+        sizes = tvm.tir.analysis.calculate_allocated_bytes(f)
+        vtcm_capacity = kwargs.get("vtcm_capacity", 0)
+        vtcm_allocated = sizes.get("global.vtcm", 0)
+        if 0 < vtcm_capacity < vtcm_allocated:
+            raise InstantiationError("Skipped because of invalid vtcm memory usage limit")
+
         return f
 
     return tvm.tir.transform.prim_func_pass(verify_pass, opt_level=0)

@@ -19,6 +19,8 @@
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "tvm/arith/analyzer.h"
+
 namespace tvm {
 namespace tir {
 
@@ -84,6 +86,8 @@ struct TResult {
 
 class FlopEstimator : private ExprFunctor<TResult(const PrimExpr& n)>,
                       private StmtFunctor<TResult(const Stmt& n)> {
+  arith::Analyzer ana;
+
  public:
   TResult VisitExpr(const PrimExpr& expr) override { return ExprFunctor::VisitExpr(expr); }
   TResult VisitStmt(const Stmt& stmt) override { return StmtFunctor::VisitStmt(stmt); }
@@ -112,6 +116,15 @@ class FlopEstimator : private ExprFunctor<TResult(const PrimExpr& n)>,
   TResult VisitExpr_(const GTNode* op) override { return TResult(); }
   TResult VisitExpr_(const GENode* op) override { return TResult(); }
 
+  int64_t GetLoopExtent(const ForNode* node, const arith::Analyzer& ana) {
+    int64_t bound = ana.const_int_bound(node->extent)->max_value;
+    if (bound == arith::ConstIntBound::kPosInf) {
+      return 1;  // Analyzer could not determine a valid bound, use 1 instead.
+    } else {
+      return bound;
+    }
+  }
+
   TResult VisitExpr_(const NotNode* op) override { return VisitExpr(op->a); }
   TResult VisitExpr_(const AndNode* op) final {
     TResult result = VisitExpr(op->a);
@@ -125,6 +138,11 @@ class FlopEstimator : private ExprFunctor<TResult(const PrimExpr& n)>,
   }
 
   TResult VisitExpr_(const BufferLoadNode* op) override { return TResult(); }
+  TResult VisitStmt_(const AttrStmtNode* op) override {
+    TResult result = VisitStmt(op->body);
+    result += VisitExpr(op->value);
+    return result;
+  }
   TResult VisitStmt_(const BufferStoreNode* store) override { return VisitExpr(store->value); }
   TResult VisitStmt_(const BlockRealizeNode* block) override {
     return VisitStmt(block->block->body);
@@ -138,17 +156,20 @@ class FlopEstimator : private ExprFunctor<TResult(const PrimExpr& n)>,
     return result;
   }
   TResult VisitStmt_(const ForNode* loop) override {
+    ana.Bind(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+    const auto int_imm = GetLoopExtent(loop, ana);
     TResult result = VisitStmt(loop->body);
-    const auto* int_imm = loop->extent.as<IntImmNode>();
-    ICHECK(int_imm) << "TypeError: Expect the extent of a loop to be IntImm, but gets: "
-                    << loop->extent->GetTypeKey();
-    result *= int_imm->value;
+    result *= int_imm;
     return result;
   }
 
   TResult VisitStmt_(const IfThenElseNode* branch) override {
     TResult cond = VisitExpr(branch->condition);
-    cond += VisitStmt(branch->then_case).MaxWith(VisitStmt(branch->else_case));
+    if (branch->else_case) {
+      cond += VisitStmt(branch->then_case).MaxWith(VisitStmt(branch->else_case.value()));
+    } else {
+      cond += VisitStmt(branch->then_case);
+    }
     return cond;
   }
 
@@ -170,6 +191,8 @@ class FlopEstimator : private ExprFunctor<TResult(const PrimExpr& n)>,
   TResult VisitExpr_(const FloatImmNode* op) override { return TResult(); }
   TResult VisitExpr_(const CastNode* op) override { return VisitExpr(op->value); }
   TResult VisitStmt_(const AllocateConstNode* op) override { return VisitStmt(op->body); }
+  TResult VisitStmt_(const AllocateNode* op) override { return VisitStmt(op->body); }
+  TResult VisitStmt_(const DeclBufferNode* op) override { return VisitStmt(op->body); }
 
   TResult VisitStmt_(const SeqStmtNode* seq) override {
     TResult result;
@@ -204,17 +227,22 @@ double EstimateTIRFlops(const Stmt& stmt) {
 double EstimateTIRFlops(const IRModule& mod) {
   FlopEstimator counter;
   TResult result;
-  VisitPrimFuncs(mod, [&result, &counter](const PrimFuncNode* f) {
-    result += counter.VisitStmt(f->body);  //
+  double cached_result = 0;
+  VisitPrimFuncs(mod, [&result, &counter, &cached_result](const PrimFuncNode* f) {
+    if (auto cached = f->attrs.GetAttr<Integer>("estimated_flops")) {
+      cached_result += cached.value()->value;
+    } else {
+      result += counter.VisitStmt(f->body);  //
+    }
   });
-  return PostprocessResults(result);
+  return PostprocessResults(result) + cached_result;
 }
 
 TVM_REGISTER_GLOBAL("tir.analysis.EstimateTIRFlops").set_body_typed([](ObjectRef obj) -> double {
-  if (const auto* mod = obj.as<IRModuleNode>()) {
-    return EstimateTIRFlops(GetRef<IRModule>(mod));
-  } else if (const auto* stmt = obj.as<StmtNode>()) {
-    return EstimateTIRFlops(GetRef<Stmt>(stmt));
+  if (auto mod = obj.as<IRModule>()) {
+    return EstimateTIRFlops(mod.value());
+  } else if (auto stmt = obj.as<Stmt>()) {
+    return EstimateTIRFlops(stmt.value());
   } else {
     LOG(FATAL) << "TypeError: Expect the input to be either IRModule or Stmt, but gets: "
                << obj->GetTypeKey();

@@ -16,12 +16,28 @@
 # under the License.
 
 if(USE_CCACHE) # True for AUTO, ON, /path/to/ccache
-  if(DEFINED CXX_COMPILER_LAUNCHER OR DEFINED C_COMPILER_LAUNCHER)
+
+  if(DEFINED CMAKE_C_COMPILER_LAUNCHER)
     if("${USE_CCACHE}" STREQUAL "AUTO")
-      message(STATUS "CXX_COMPILER_LAUNCHER or C_COMPILER_LAUNCHER already defined, not using ccache")
+      message(STATUS "CMAKE_C_COMPILER_LAUNCHER already defined.  Not using ccache.")
     elseif("${USE_CCACHE}" MATCHES ${IS_TRUE_PATTERN})
-      message(FATAL_ERROR "CXX_COMPILER_LAUNCHER or C_COMPILER_LAUNCHER is already defined, refusing to override with ccache. Either unset or disable ccache.")
+      message(FATAL_ERROR "CMAKE_C_COMPILER_LAUNCHER already defined.  Refusing to override with ccache. Either unset or disable ccache.")
     endif()
+
+  elseif(DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+    if("${USE_CCACHE}" STREQUAL "AUTO")
+      message(STATUS "CMAKE_CXX_COMPILER_LAUNCHER already defined.  Not using ccache.")
+    elseif("${USE_CCACHE}" MATCHES ${IS_TRUE_PATTERN})
+      message(FATAL_ERROR "CMAKE_CXX_COMPILER_LAUNCHER already defined.  Refusing to override with ccache. Either unset or disable ccache.")
+    endif()
+
+  elseif(DEFINED CMAKE_CUDA_COMPILER_LAUNCHER)
+    if("${USE_CCACHE}" STREQUAL "AUTO")
+      message(STATUS "CMAKE_CUDA_COMPILER_LAUNCHER already defined.  Not using ccache.")
+    elseif("${USE_CCACHE}" MATCHES ${IS_TRUE_PATTERN})
+      message(FATAL_ERROR "CMAKE_CUDA_COMPILER_LAUNCHER already defined.  Refusing to override with ccache. Either unset or disable ccache.")
+    endif()
+
   else()
     if("${USE_CCACHE}" STREQUAL "AUTO") # Auto mode
       find_program(CCACHE_FOUND "ccache")
@@ -45,8 +61,9 @@ if(USE_CCACHE) # True for AUTO, ON, /path/to/ccache
     endif()
     # Set the flag for ccache
     if(DEFINED PATH_TO_CCACHE)
-      set(CXX_COMPILER_LAUNCHER "${PATH_TO_CCACHE}")
-      set(C_COMPILER_LAUNCHER "${PATH_TO_CCACHE}")
+      set(CMAKE_CXX_COMPILER_LAUNCHER "${PATH_TO_CCACHE}")
+      set(CMAKE_C_COMPILER_LAUNCHER "${PATH_TO_CCACHE}")
+      set(CMAKE_CUDA_COMPILER_LAUNCHER "${PATH_TO_CCACHE}")
     endif()
   endif()
 endif(USE_CCACHE)

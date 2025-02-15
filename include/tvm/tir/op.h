@@ -31,6 +31,7 @@
 #include <tvm/ir/expr.h>
 #include <tvm/ir/op.h>
 #include <tvm/ir/type.h>
+#include <tvm/tir/builtin.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/stmt.h>
 
@@ -39,6 +40,9 @@
 #include <type_traits>
 
 namespace tvm {
+
+#define TVM_TIR_REGISTER_OP(OpName) \
+  TVM_REGISTER_OP("tir." OpName).set_attr<TScriptPrinterName>("TScriptPrinterName", OpName)
 
 // Most common operators can be overloaded by argument type(PrimExpr).
 // So we put them under the root namespace.
@@ -675,6 +679,15 @@ TVM_DLL PrimExpr LargeUIntImm(DataType dtype, int64_t low, int64_t high, Span sp
 TVM_DLL PrimExpr q_multiply_shift(PrimExpr x, PrimExpr y, PrimExpr q, PrimExpr s,
                                   Span span = Span());
 
+/*!
+ * \brief Fast_erf_float expression from Eigen
+ *
+ * \param arg The input expression.
+ * \param bits The number of bits in the type.
+ * \return The constructed expression.
+ */
+TVM_DLL PrimExpr fast_erf_float_expr(PrimExpr arg, int bits);
+
 // Intrinsic operators
 #define TVM_DECLARE_INTRIN_UNARY(OpName)                                \
   inline PrimExpr OpName(PrimExpr x, Span span = Span()) {              \
@@ -853,7 +866,12 @@ inline bool is_const_number(const PrimExpr& x);
  */
 template <typename FReduce>
 inline PrimExpr foldl(FReduce freduce, PrimExpr init_value, const Array<PrimExpr>& values,
-                      Span span = Span());
+                      Span span = Span()) {
+  for (PrimExpr val : values) {
+    init_value = freduce(init_value, val, span);
+  }
+  return init_value;
+}
 
 /*!
  * \brief Check whether x is a constant power of two
@@ -922,7 +940,8 @@ inline PrimExpr MakeConstScalar(DataType t, ValueType value, Span span = Span())
       return LargeUIntImm(t, static_cast<int64_t>(low), static_cast<int64_t>(high), span);
     }
   }
-  if (t.is_float() || t.is_bfloat16()) return FloatImm(t, static_cast<double>(value), span);
+  if (t.is_float() || t.is_bfloat16() || t.is_float8())
+    return FloatImm(t, static_cast<double>(value), span);
   // For now, we store const scalar values of custom datatypes within doubles; later, during the
   // datatypes lowering pass, we will lower the value to its true representation in the format
   // specified by the datatype.
@@ -931,7 +950,7 @@ inline PrimExpr MakeConstScalar(DataType t, ValueType value, Span span = Span())
     return FloatImm(t, static_cast<double>(value), span);
   }
   LOG(FATAL) << "cannot make const for type " << t;
-  return PrimExpr();
+  throw;
 }
 
 template <>
@@ -941,10 +960,16 @@ inline PrimExpr MakeConstScalar(DataType t, bool value, Span span) {
 
 template <typename ValueType, typename>
 inline PrimExpr make_const(DataType t, ValueType value, Span span) {
-  if (t.lanes() == 1) {
+  if (t.is_scalar()) {
     return MakeConstScalar(t, value, span);
   } else {
-    return tir::Broadcast(MakeConstScalar(t.element_of(), value, span), t.lanes(), span);
+    if (t.is_fixed_length_vector()) {
+      return tir::Broadcast(MakeConstScalar(t.element_of(), value, span), t.lanes(), span);
+    } else {
+      PrimExpr lanes =
+          tir::Mul(tir::Call(DataType::Int(32), tir::builtin::vscale(), {}), t.vscale_factor());
+      return tir::Broadcast(MakeConstScalar(t.element_of(), value, span), lanes, span);
+    }
   }
 }
 
@@ -953,15 +978,6 @@ inline PrimExpr make_zero(DataType t, Span span) {
     return reinterpret(t, make_const(DataType::UInt(64), 0, span));
   }
   return make_const(t, 0, span);
-}
-
-template <typename FReduce>
-inline PrimExpr foldl(FReduce freduce, PrimExpr init_value, const Array<PrimExpr>& values,
-                      Span span) {
-  for (PrimExpr val : values) {
-    init_value = freduce(init_value, val, span);
-  }
-  return init_value;
 }
 
 }  // namespace tir

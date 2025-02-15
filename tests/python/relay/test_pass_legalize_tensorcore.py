@@ -97,7 +97,7 @@ def test_legalize_conv2d_NHWC():
             a = before()
             a = run_opt_pass(a, transform.Legalize())
             b = run_opt_pass(expected(), transform.InferType())
-        assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a) + "Expected = \n" + str(b)
+        tvm.ir.assert_structural_equal(a, b)
 
     for dtype in ["float16", "int8", "int4"]:
         # conv2d pad batch
@@ -177,7 +177,7 @@ def test_legalize_conv2d_HWNC():
             a = before()
             a = run_opt_pass(a, transform.Legalize())
             b = run_opt_pass(expected(), transform.InferType())
-        assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a) + "Expected = \n" + str(b)
+        tvm.ir.assert_structural_equal(a, b)
 
     # conv2d pad batch
     _test_legalize_conv2d((16, 16, 7, 64), (3, 3, 64, 64), (1, 0, 0), "int8")
@@ -250,7 +250,7 @@ def test_legalize_dense():
             a = run_opt_pass(a, transform.Legalize())
             b = run_opt_pass(expected(), transform.InferType())
 
-        assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a) + "Expected = \n" + str(b)
+        tvm.ir.assert_structural_equal(a, b)
 
     # dense
     for dtype in ["float16", "int8"]:
@@ -277,17 +277,27 @@ def test_legalize_dense():
 
 @tvm.testing.uses_gpu
 def test_legalize_batch_matmul():
-    def _test_legalize_batch_matmul(data_shape, kernel_shape, pad_shape, dtype, do_pad=True):
+    def _test_legalize_batch_matmul(
+        data_shape, kernel_shape, pad_shape, dtype, do_pad=True, transpose_a=False, transpose_b=True
+    ):
         """test legalize dense to enable tensorcore"""
-        B, M, _ = data_shape
-        _, N, _ = kernel_shape
+        if transpose_a:
+            B, _, M = data_shape
+        else:
+            B, M, _ = data_shape
+
+        if transpose_b:
+            _, N, _ = kernel_shape
+        else:
+            _, _, N = kernel_shape
+
         out_shape = (B, M, N)
         dm, dk, dn = pad_shape
 
         def before():
             x = relay.var("x", shape=data_shape, dtype=dtype)
             weight = relay.var("weight", shape=kernel_shape, dtype=dtype)
-            y = relay.nn.batch_matmul(x, weight)
+            y = relay.nn.batch_matmul(x, weight, transpose_a=transpose_a, transpose_b=transpose_b)
             y = relay.Function([x, weight], y)
             return y
 
@@ -298,19 +308,31 @@ def test_legalize_batch_matmul():
         def expected():
             if not do_pad:
                 return before()
+
             x = relay.var("x", shape=data_shape, dtype=dtype)
+            weight = relay.var("weight", shape=(kernel_shape), dtype=dtype)
+
             if dm or dk:
-                x_pad = relay.nn.pad(x, pad_width=((0, 0), (0, dm), (0, dk)))
+                if transpose_a:
+                    x_pad = relay.nn.pad(x, pad_width=((0, 0), (0, dk), (0, dm)))
+                else:
+                    x_pad = relay.nn.pad(x, pad_width=((0, 0), (0, dm), (0, dk)))
             else:
                 x_pad = x
-            weight = relay.var("weight", shape=(kernel_shape), dtype=dtype)
+
             if dn or dk:
-                weight_pad = relay.nn.pad(weight, pad_width=((0, 0), (0, dn), (0, dk)))
+                if transpose_b:
+                    weight_pad = relay.nn.pad(weight, pad_width=((0, 0), (0, dn), (0, dk)))
+                else:
+                    weight_pad = relay.nn.pad(weight, pad_width=((0, 0), (0, dk), (0, dn)))
             else:
                 weight_pad = weight
+
             y_pad = relay.nn.batch_matmul(
                 x_pad,
                 weight_pad,
+                transpose_a=transpose_a,
+                transpose_b=transpose_b,
             )
             if dm or dn:
                 y = relay.strided_slice(y_pad, begin=[0, 0, 0], end=out_shape)
@@ -323,7 +345,7 @@ def test_legalize_batch_matmul():
             a = before()
             a = run_opt_pass(a, transform.Legalize())
             b = run_opt_pass(expected(), transform.InferType())
-        assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a) + "Expected = \n" + str(b)
+        tvm.ir.assert_structural_equal(a, b)
 
     for dtype in ["float16", "int8"]:
         _test_legalize_batch_matmul((16, 8, 16), (16, 32, 16), (0, 0, 0), dtype, False)
@@ -342,6 +364,13 @@ def test_legalize_batch_matmul():
     _test_legalize_batch_matmul((16, 3, 32), (16, 32, 32), (5, 0, 0), "int4")
     _test_legalize_batch_matmul((16, 8, 16), (16, 32, 16), (0, 16, 0), "int4")
     _test_legalize_batch_matmul((16, 2, 16), (16, 32, 16), (0, 0, 0), "int4", False)
+
+    _test_legalize_batch_matmul(
+        (16, 8, 16), (16, 16, 32), (0, 0, 0), "float16", False, transpose_b=False
+    )
+    _test_legalize_batch_matmul(
+        (16, 16, 8), (16, 32, 16), (0, 0, 0), "float16", False, transpose_a=True
+    )
 
 
 if __name__ == "__main__":

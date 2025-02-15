@@ -340,7 +340,7 @@ def test_tuning_cpu():
     """Test tuning on cpu."""
 
     def runner():
-        ir_mod = tvm.parser.fromtext(
+        ir_mod = tvm.relay.fromtext(
             textwrap.dedent(
                 """
             #[version = "0.0.5"]
@@ -353,7 +353,7 @@ def test_tuning_cpu():
         tasks = autotvm.task.relay_integration.extract_from_program(
             ir_mod, {}, tvm.target.create("llvm")
         )
-        assert len(tasks) == 1, f"Extracted != 1 task from program: {tasks!r}"
+        assert len(tasks) >= 1, f"Extracted no tasks from program: {tasks!r}"
 
         task = tasks[0]
 

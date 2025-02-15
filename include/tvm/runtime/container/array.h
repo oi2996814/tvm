@@ -580,6 +580,36 @@ class Array : public ObjectRef {
     }
   }
 
+  template <typename... Args>
+  static size_t CalcCapacityImpl() {
+    return 0;
+  }
+
+  template <typename... Args>
+  static size_t CalcCapacityImpl(Array<T> value, Args... args) {
+    return value.size() + CalcCapacityImpl(args...);
+  }
+
+  template <typename... Args>
+  static size_t CalcCapacityImpl(T value, Args... args) {
+    return 1 + CalcCapacityImpl(args...);
+  }
+
+  template <typename... Args>
+  static void AgregateImpl(Array<T>& dest) {}  // NOLINT(*)
+
+  template <typename... Args>
+  static void AgregateImpl(Array<T>& dest, Array<T> value, Args... args) {  // NOLINT(*)
+    dest.insert(dest.end(), value.begin(), value.end());
+    AgregateImpl(dest, args...);
+  }
+
+  template <typename... Args>
+  static void AgregateImpl(Array<T>& dest, T value, Args... args) {  // NOLINT(*)
+    dest.push_back(value);
+    AgregateImpl(dest, args...);
+  }
+
  public:
   // Array's own methods
 
@@ -679,6 +709,19 @@ class Array : public ObjectRef {
 
   /*! \brief specify container node */
   using ContainerType = ArrayNode;
+
+  /*!
+   * \brief Agregate arguments into a single Array<T>
+   * \param args sequence of T or Array<T> elements
+   * \return Agregated Array<T>
+   */
+  template <typename... Args>
+  static Array<T> Agregate(Args... args) {
+    Array<T> result;
+    result.reserve(CalcCapacityImpl(args...));
+    AgregateImpl(result, args...);
+    return result;
+  }
 
  private:
   /*!
@@ -784,8 +827,13 @@ class Array : public ObjectRef {
           // consisting of any previous elements that had mapped to
           // themselves (if any), and the element that didn't map to
           // itself.
+          //
+          // We cannot use `U()` as the default object, as `U` may be
+          // a non-nullable type.  Since the default `ObjectRef()`
+          // will be overwritten before returning, all objects will be
+          // of type `U` for the calling scope.
           all_identical = false;
-          output = ArrayNode::CreateRepeated(arr->size(), U());
+          output = ArrayNode::CreateRepeated(arr->size(), ObjectRef());
           output->InitRange(0, arr->begin(), it);
           output->SetItem(it - arr->begin(), std::move(mapped));
           it++;
@@ -800,7 +848,12 @@ class Array : public ObjectRef {
       // compatible types isn't strictly necessary, as the first
       // mapped.same_as(*it) would return false, but we might as well
       // avoid it altogether.
-      output = ArrayNode::CreateRepeated(arr->size(), U());
+      //
+      // We cannot use `U()` as the default object, as `U` may be a
+      // non-nullable type.  Since the default `ObjectRef()` will be
+      // overwritten before returning, all objects will be of type `U`
+      // for the calling scope.
+      output = ArrayNode::CreateRepeated(arr->size(), ObjectRef());
     }
 
     // Normal path for incompatible types, or post-copy path for
@@ -828,6 +881,12 @@ class Array : public ObjectRef {
     return output;
   }
 };
+
+template <typename T>
+inline constexpr bool is_tvm_array = false;
+
+template <typename T>
+inline constexpr bool is_tvm_array<Array<T>> = true;
 
 /*!
  * \brief Concat two Arrays.

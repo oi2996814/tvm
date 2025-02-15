@@ -26,6 +26,7 @@
 #include <tvm/runtime/container/string.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/runtime/device_api.h>
+#include <tvm/runtime/memory/memory_manager.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/profiling.h>
@@ -139,6 +140,28 @@ std::tuple<GraphExecutor::ShapeInfo, GraphExecutor::DtypeInfo> GraphExecutor::Ge
 }
 
 /*!
+ * \brief Get the output info of Graph by parsing the output nodes.
+ * \return The shape and dtype tuple.
+ */
+std::tuple<GraphExecutor::ShapeInfo, GraphExecutor::DtypeInfo> GraphExecutor::GetOutputInfo()
+    const {
+  GraphExecutor::ShapeInfo shape_dict;
+  GraphExecutor::DtypeInfo dtype_dict;
+  for (auto out : outputs_) {
+    uint32_t nid = out.node_id;
+    CHECK_LE(nid, nodes_.size());
+    std::string name = nodes_[nid].name;
+    CHECK_LE(nid, attrs_.shape.size());
+    auto shape = attrs_.shape[nid];
+    shape_dict.Set(name, ShapeTuple(shape));
+    CHECK_LE(nid, attrs_.dltype.size());
+    auto dtype = attrs_.dltype[nid];
+    dtype_dict.Set(name, String(dtype));
+  }
+  return std::make_tuple(shape_dict, dtype_dict);
+}
+
+/*!
  * \brief Get the output index given the name of output.
  * \param name The name of the output.
  * \return The index of output.
@@ -207,6 +230,16 @@ void GraphExecutor::SetOutputZeroCopy(int index, DLTensor* data_ref) {
 
   // check the consistency of output
   CheckExternalDLTensor(data_ref, output_node_eid);
+
+  if (nodes_[output_node.node_id].op_type == "tvm_op" &&
+      nodes_[output_node.node_id].param.func_name == "__nop") {
+    const NodeEntry& input_node = nodes_[output_node.node_id].inputs[0];
+    output_node_eid = this->entry_id(input_node);
+    ICHECK_NE(node_output_dltensors_[output_node_eid].size(), 0);
+    for (DLTensor* t : node_output_dltensors_[output_node_eid]) {
+      t->data = static_cast<char*>(data_ref->data) + data_ref->byte_offset;
+    }
+  }
 
   // Update the data pointer for output op
   for (DLTensor* t : output_dltensors_[output_node_eid]) {
@@ -392,36 +425,31 @@ void GraphExecutor::SetupStorage() {
     }
     pool_entry[sid].param_data_entry = i;
     pool_entry[sid].device_type = device_type;
-    pool_entry[sid].scope = storage_scope;
 
     DLDataType t = vtype[i];
-    if (!details::Is2DStorage(storage_scope)) {
-      size_t size = 1;
-      for (int64_t sz : attrs_.shape[i]) {
-        size *= static_cast<size_t>(sz);
-      }
-      size_t bits = t.bits * t.lanes;
-      ICHECK(bits % 8U == 0U || bits == 1U || bits == 4U);
-      int64_t bytes = ((bits + 7U) / 8U) * size;
-      pool_entry[sid].shape[0] = std::max(pool_entry[sid].shape[0], bytes);
-      pool_entry[sid].dtype = DLDataType{kDLFloat, 32, 1};
-    } else {
-      if (pool_entry[sid].shape.size() == 1) {
-        pool_entry[sid].shape.resize(3, 0);
-      }
-      size_t axis = runtime::DefaultTextureLayoutSeparator(attrs_.shape[i].size(), storage_scope);
-      auto shape = ApplyTexture2DFlattening<int64_t>(attrs_.shape[i], attrs_.shape[i].size(), axis);
-      pool_entry[sid].shape[0] = std::max(pool_entry[sid].shape[0], shape.height);
-      pool_entry[sid].shape[1] = std::max(pool_entry[sid].shape[1], shape.width);
-      CHECK(pool_entry[sid].shape[2] == 0 || pool_entry[sid].shape[2] == shape.channel)
-          << pool_entry[sid].shape[2] << " != " << shape.channel
-          << ",  texture channel length must be consistent within a storage pool";
-      pool_entry[sid].shape[2] = shape.channel;
-      CHECK(pool_entry[sid].dtype.bits == 0 || TypeEqual(pool_entry[sid].dtype, t))
-          << DLDataType2String(pool_entry[sid].dtype) << " != " << DLDataType2String(t)
-          << ", pool entry for 2d texure allocations must be of the same type;"
-          << " downstream error from memory planner likely";
+
+    auto dev_type = pool_entry[sid].device_type;
+    const auto& cit = std::find_if(devices_.begin(), devices_.end(), [&dev_type](const Device& d) {
+      return dev_type == static_cast<int>(d.device_type);
+    });
+    Device dev = cit == devices_.end() ? devices_[0] : *cit;
+
+    DLTensor temp;
+    temp.data = nullptr;
+    temp.device = dev;
+    temp.ndim = attrs_.shape[i].size();
+    temp.dtype = t;
+    temp.shape = static_cast<int64_t*>(attrs_.shape[i].data());
+    temp.strides = nullptr;
+    temp.byte_offset = 0;
+
+    int64_t alloc_size = DeviceAPI::Get(dev)->GetDataSize(temp, String(storage_scope));
+
+    if (pool_entry[sid].alloc_size < alloc_size) {
       pool_entry[sid].dtype = t;
+      pool_entry[sid].shape = attrs_.shape[i];
+      pool_entry[sid].alloc_size = alloc_size;
+      pool_entry[sid].scope = storage_scope;
     }
   }
 
@@ -434,17 +462,14 @@ void GraphExecutor::SetupStorage() {
     });
     Device dev = cit == devices_.end() ? devices_[0] : *cit;
     if (pit.linked_param.defined()) {
-      storage_pool_.push_back(pit.linked_param);
+      ndarray_pool_.push_back(pit.linked_param);
     } else {
       std::vector<int64_t> shape = pit.shape;
-      if (shape.size() == 1) {
-        shape[0] = (shape[0] + 3) / 4;
-      }
-      Optional<String> mem_scope;
-      if (!pit.scope.empty()) {
-        mem_scope = String(pit.scope);
-      }
-      storage_pool_.push_back(NDArray::Empty(shape, pit.dtype, dev, mem_scope));
+      String mem_scope = pit.scope.empty() ? "global" : String(pit.scope);
+      auto allocator = MemoryManager::GetOrCreateAllocator(dev, AllocatorType::kPooled);
+      auto buffer = allocator->Alloc(dev, pit.alloc_size, kAllocAlignment, pit.dtype);
+      auto stor = Storage(buffer, allocator);
+      storage_pool_.push_back(stor);
     }
   }
 
@@ -453,11 +478,22 @@ void GraphExecutor::SetupStorage() {
   // is mapped to this pool.
   data_entry_.resize(num_node_entries());
   data_alignment_.resize(num_node_entries());
-  for (size_t i = 0; i < data_entry_.size(); ++i) {
+  // sid_to_eid has a size of storage_id's size, which is the size of pool_entry.
+  sid_to_eid_.resize(pool_entry.size());
+  for (size_t i = 0, j = 0; i < data_entry_.size(); ++i) {
     int storage_id = attrs_.storage_id[i];
-    ICHECK_LT(static_cast<size_t>(storage_id), storage_pool_.size());
-    data_entry_[i] = storage_pool_[storage_id].CreateView(attrs_.shape[i], vtype[i]);
+    // Update "storage_id -> entry_id" pair.
+    sid_to_eid_[storage_id].push_back(i);
 
+    ICHECK_LT(static_cast<size_t>(storage_id), pool_entry.size());
+
+    if (pool_entry[storage_id].linked_param.defined()) {
+      data_entry_[i] = ndarray_pool_[j++];
+    } else {
+      std::string storage_scope = attrs_.storage_scope.empty() ? "global" : attrs_.storage_scope[i];
+      data_entry_[i] = storage_pool_[storage_id]->AllocNDArrayScoped(0, ShapeTuple(attrs_.shape[i]),
+                                                                     vtype[i], storage_scope);
+    }
     const DLTensor* tmp = data_entry_[i].operator->();
     data_alignment_[i] = details::GetDataAlignment(*tmp);
   }
@@ -465,6 +501,7 @@ void GraphExecutor::SetupStorage() {
 
 void GraphExecutor::SetupOpExecs() {
   op_execs_.resize(this->GetNumOfNodes());
+  op_profile_execs_.resize(this->GetNumOfNodes());
   input_dltensors_.resize(num_node_entries());
   output_dltensors_.resize(num_node_entries());
   both_output_opinput_dltensors_.resize(num_node_entries());
@@ -482,19 +519,19 @@ void GraphExecutor::SetupOpExecs() {
   for (uint32_t nid = 0; nid < this->GetNumOfNodes(); ++nid) {
     const auto& inode = nodes_[nid];
     if (inode.op_type == "null") continue;
-    std::vector<DLTensor> args;
+    std::vector<DLTensor*> args;
     for (const auto& e : inode.inputs) {
       uint32_t eid = this->entry_id(e);
-      args.push_back(*(data_entry_[eid].operator->()));
+      args.push_back(const_cast<DLTensor*>(data_entry_[eid].operator->()));
     }
     for (uint32_t index = 0; index < inode.param.num_outputs; ++index) {
       uint32_t eid = this->entry_id(nid, index);
-      args.push_back(*(data_entry_[eid].operator->()));
+      args.push_back(const_cast<DLTensor*>(data_entry_[eid].operator->()));
     }
     ICHECK(inode.op_type == "tvm_op") << "Can only take tvm_op as op";
 
     std::shared_ptr<OpArgs> op_args = nullptr;
-    std::tie(op_execs_[nid], op_args) = CreateTVMOp(inode.param, args);
+    std::tie(op_execs_[nid], op_profile_execs_[nid], op_args) = CreateTVMOp(inode.param, args);
 
     for (size_t i = 0; i < inode.inputs.size(); i++) {
       uint32_t input_eid = this->entry_id(inode.inputs[i]);
@@ -502,6 +539,23 @@ void GraphExecutor::SetupOpExecs() {
       if (input_node_eids.count(input_eid) > 0) {
         input_dltensors_[input_eid].push_back(
             static_cast<DLTensor*>(op_args->arg_values[i].v_handle));
+
+        // Data entry who has the same storage_id should also be pushed into "input_dltensors" and
+        // being able to be updated by "SetInputZeroCopy()". This is to handle the situation that a
+        // "relay.reshape" follows immediately after input and input dltensor and reshape's output
+        // dltensor point to the same data_entry.
+        auto storage_id = attrs_.storage_id[input_eid];
+        for (auto eid : sid_to_eid_[storage_id]) {
+          input_dltensors_[input_eid].push_back(
+              const_cast<DLTensor*>(data_entry_[eid].operator->()));
+        }
+      } else {
+        const auto& arg_node = nodes_[inode.inputs[i].node_id];
+        if (arg_node.op_type == "tvm_op" && arg_node.param.func_name == "__nop") {
+          uint32_t arg_input_eid = this->entry_id(arg_node.inputs[0]);
+          input_dltensors_[arg_input_eid].push_back(
+              static_cast<DLTensor*>(op_args->arg_values[i].v_handle));
+        }
       }
       // check if any model output is the input of the op
       if (output_node_eids.count(input_eid) > 0) {
@@ -516,13 +570,19 @@ void GraphExecutor::SetupOpExecs() {
       if (output_node_eids.count(output_eid) > 0) {
         output_dltensors_[output_eid].push_back(
             static_cast<DLTensor*>(op_args->arg_values[i].v_handle));
+      } else {
+        // If the node is not an output, keep its output for record and support set_output_zero_copy
+        // of reshape __nop nodes.
+        node_output_dltensors_[output_eid].push_back(
+            static_cast<DLTensor*>(op_args->arg_values[i].v_handle));
       }
     }
   }
 }
 
-std::pair<std::function<void()>, std::shared_ptr<GraphExecutor::OpArgs>> GraphExecutor::CreateTVMOp(
-    const TVMOpParam& param, const std::vector<DLTensor>& args) {
+std::tuple<std::function<void()>, std::function<void(TVMRetValue*)>,
+           std::shared_ptr<GraphExecutor::OpArgs>>
+GraphExecutor::CreateTVMOp(const TVMOpParam& param, const std::vector<DLTensor*>& args) {
   std::shared_ptr<GraphExecutor::OpArgs> arg_ptr = std::make_shared<GraphExecutor::OpArgs>();
   // setup address.
   arg_ptr->args = args;
@@ -531,7 +591,7 @@ std::pair<std::function<void()>, std::shared_ptr<GraphExecutor::OpArgs>> GraphEx
   }
   for (size_t i = 0; i < arg_ptr->args.size(); ++i) {
     TVMValue v;
-    DLTensor* t = &arg_ptr->args[i];
+    DLTensor* t = arg_ptr->args[i];
     v.v_handle = t;
     arg_ptr->arg_values.push_back(v);
     arg_ptr->arg_tcodes.push_back(kTVMDLTensorHandle);
@@ -544,7 +604,7 @@ std::pair<std::function<void()>, std::shared_ptr<GraphExecutor::OpArgs>> GraphEx
   }
 
   if (param.func_name == "__nop") {
-    return {[]() {}, arg_ptr};
+    return {[]() {}, [](TVMRetValue* rv) {}, arg_ptr};
   } else if (param.func_name == "__copy") {
     // Perform cross device data copy.
     // Directly copy data from the input to the output.
@@ -554,25 +614,34 @@ std::pair<std::function<void()>, std::shared_ptr<GraphExecutor::OpArgs>> GraphEx
       DLTensor* to = static_cast<DLTensor*>(arg_ptr->arg_values[1].v_handle);
       TVM_CCALL(TVMArrayCopyFromTo(from, to, nullptr));
     };
-    return {fexec, arg_ptr};
+    return {fexec, [](TVMRetValue* rv) {}, arg_ptr};
   }
 
   // Get compiled function from the module that contains both host and device
   // code.
   tvm::runtime::PackedFunc pf = module_.GetFunction(param.func_name, true);
   ICHECK(pf != nullptr) << "no such function in module: " << param.func_name;
-
   auto fexec = [arg_ptr, pf]() {
     TVMRetValue rv;
     TVMArgs targs(arg_ptr->arg_values.data(), arg_ptr->arg_tcodes.data(),
                   static_cast<int>(arg_ptr->arg_values.size()));
     pf.CallPacked(targs, &rv);
   };
-  return {fexec, arg_ptr};
+
+  pf = module_.GetFunction(param.func_name + "_debug", true);
+  std::function<void(TVMRetValue*)> fexec_profile = nullptr;
+  if (pf != nullptr) {
+    fexec_profile = [arg_ptr, pf](TVMRetValue* rv) {
+      TVMArgs targs(arg_ptr->arg_values.data(), arg_ptr->arg_tcodes.data(),
+                    static_cast<int>(arg_ptr->arg_values.size()));
+      pf.CallPacked(targs, rv);
+    };
+  }
+
+  return {fexec, fexec_profile, arg_ptr};
 }
 
-PackedFunc GraphExecutor::GetFunction(const std::string& name,
-                                      const ObjectPtr<Object>& sptr_to_self) {
+PackedFunc GraphExecutor::GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) {
   // Return member functions during query.
   if (name == "set_input") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
@@ -606,7 +675,19 @@ PackedFunc GraphExecutor::GetFunction(const std::string& name,
       if (args.num_args == 2) {
         this->CopyOutputTo(args[0], args[1]);
       } else {
-        *rv = this->GetOutput(args[0]);
+        int out_idx = -1;
+        if (String::CanConvertFrom(args[0])) {
+          for (size_t i = 0; i < outputs_.size(); i++) {
+            std::string& name = nodes_[outputs_[i].node_id].name;
+            if (args[0].operator String() == name) {
+              out_idx = i;
+            }
+          }
+          CHECK(out_idx != -1) << "Invalid output node:" << args[0].operator String();
+        } else {
+          out_idx = args[0];
+        }
+        *rv = this->GetOutput(out_idx);
       }
     });
   } else if (name == "get_input") {
@@ -674,9 +755,29 @@ PackedFunc GraphExecutor::GetFunction(const std::string& name,
       CHECK(String::CanConvertFrom(args[0])) << "Input key is not a string";
       *rv = this->GetInputIndex(args[0].operator String());
     });
+  } else if (name == "get_output_index") {
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      CHECK(String::CanConvertFrom(args[0])) << "Output key is not a string";
+      int out_idx = -1;
+      for (size_t i = 0; i < outputs_.size(); i++) {
+        std::string& name = nodes_[outputs_[i].node_id].name;
+        if (args[0].operator String() == name) {
+          out_idx = i;
+        }
+      }
+      *rv = out_idx;
+    });
   } else if (name == "get_input_info") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
       auto [shape_info, dtype_info] = this->GetInputInfo();
+      Map<String, ObjectRef> input_info;
+      input_info.Set("shape", shape_info);
+      input_info.Set("dtype", dtype_info);
+      *rv = input_info;
+    });
+  } else if (name == "get_output_info") {
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      auto [shape_info, dtype_info] = this->GetOutputInfo();
       Map<String, ObjectRef> input_info;
       input_info.Set("shape", shape_info);
       input_info.Set("dtype", dtype_info);

@@ -47,10 +47,9 @@ import argparse
 import collections
 import os
 import re
-import textwrap
 import sys
+import textwrap
 import typing
-
 
 RequirementsByPieceType = typing.List[typing.Tuple[str, typing.Tuple[str, typing.List[str]]]]
 
@@ -64,14 +63,15 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
         (
             "Base requirements needed to install tvm",
             [
-                "attrs",
                 "cloudpickle",
                 "decorator",
+                "ml_dtypes",
                 "numpy",
+                "packaging",
                 "psutil",
                 "scipy",
-                "synr",
                 "tornado",
+                "typing_extensions",
             ],
         ),
     ),
@@ -235,7 +235,6 @@ ConstraintsType = typing.List[typing.Tuple[str, typing.Union[None, str]]]
 #    here. Include a comment linking to context or explaining why the constraint is in place.
 CONSTRAINTS = [
     ("astroid", None),
-    ("attrs", None),
     ("autodocsumm", None),
     ("black", "==20.8b1"),
     ("cloudpickle", None),
@@ -247,7 +246,7 @@ CONSTRAINTS = [
         "docutils",
         "<0.17",
     ),  # Work around https://github.com/readthedocs/sphinx_rtd_theme/issues/1115
-    ("ethos-u-vela", "==3.2.0"),
+    ("ethos-u-vela", "==3.8.0"),
     ("future", None),
     ("h5py", "==2.10.0"),
     ("image", None),
@@ -270,14 +269,14 @@ CONSTRAINTS = [
     ("sphinx_autodoc_annotation", None),
     ("sphinx_gallery", None),
     ("sphinx_rtd_theme", None),
-    ("synr", "==0.6.0"),
     ("tensorflow", None),
     ("tensorflow-estimator", None),
     ("tflite", None),
     ("torch", None),
     ("torchvision", None),
     ("tornado", None),
-    ("xgboost", ">=1.1.0,<1.6.0"),  # From PR #4953 & Issue #12009
+    ("typing_extensions", None),
+    ("xgboost", ">=1.1.0"),  # From PR #4953 & Issue #12009
 ]
 
 ################################################################################

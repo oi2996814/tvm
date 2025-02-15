@@ -23,7 +23,6 @@
  */
 
 #include <dmlc/json.h>
-#include <tvm/ir/expr.h>
 #include <tvm/runtime/c_backend_api.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/runtime/packed_func.h>
@@ -94,13 +93,13 @@ std::set<DLDeviceType> seen_devices;
 std::mutex seen_devices_lock;
 
 Timer Timer::Start(Device dev) {
-  auto f = Registry::Get(std::string("profiling.timer.") + DeviceName(dev.device_type));
+  auto f = Registry::Get(std::string("profiling.timer.") + DLDeviceType2Str(dev.device_type));
   if (f == nullptr) {
     {
       std::lock_guard<std::mutex> lock(seen_devices_lock);
       if (seen_devices.find(dev.device_type) == seen_devices.end()) {
         LOG(WARNING)
-            << "No timer implementation for " << DeviceName(dev.device_type)
+            << "No timer implementation for " << DLDeviceType2Str(dev.device_type)
             << ", using default timer instead. It may be inaccurate or have extra overhead.";
         seen_devices.insert(dev.device_type);
       }
@@ -653,7 +652,7 @@ String ReportNode::AsTable(bool sort, bool aggregate, bool compute_col_sums) con
 }
 
 std::string DeviceString(Device dev) {
-  return DeviceName(dev.device_type) + std::to_string(dev.device_id);
+  return DLDeviceType2Str(dev.device_type) + std::to_string(dev.device_id);
 }
 
 Report Profiler::Report() {
@@ -672,7 +671,7 @@ Report Profiler::Report() {
     rows.push_back(row);
   }
 
-  // the last couple of call frames are the overall times
+  // the last frames are the overall times
   double overall_time_us = 0;
   std::unordered_map<String, Map<String, ObjectRef>> device_metrics;
   for (size_t i = 0; i < devs_.size(); i++) {
@@ -777,7 +776,6 @@ Report Report::FromJSON(String json) {
       configuration = parse_metrics(&reader);
     }
   }
-
   return Report(calls, device_metrics, configuration);
 }
 
@@ -862,7 +860,7 @@ TVM_REGISTER_GLOBAL("runtime.profiling.ProfileFunction")
 
 PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
                              int limit_zero_time_iterations, int cooldown_interval_ms,
-                             int repeats_to_cooldown, PackedFunc f_preproc) {
+                             int repeats_to_cooldown, int cache_flush_bytes, PackedFunc f_preproc) {
   ICHECK(pf != nullptr);
 
   if (static_cast<int>(dev.device_type) == static_cast<int>(kDLMicroDev)) {
@@ -872,12 +870,19 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
   }
 
   auto ftimer = [pf, dev, number, repeat, min_repeat_ms, limit_zero_time_iterations,
-                 cooldown_interval_ms, repeats_to_cooldown,
+                 cooldown_interval_ms, repeats_to_cooldown, cache_flush_bytes,
                  f_preproc](TVMArgs args, TVMRetValue* rv) mutable {
     TVMRetValue temp;
     std::ostringstream os;
     // skip first time call, to activate lazy compilation components.
     pf.CallPacked(args, &temp);
+
+    // allocate two large arrays to flush L2 cache
+    NDArray arr1, arr2;
+    if (cache_flush_bytes > 0) {
+      arr1 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
+      arr2 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
+    }
 
     DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
@@ -893,7 +898,10 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
           number = static_cast<int>(
               std::max((min_repeat_ms / (duration_ms / number) + 1), number * golden_ratio));
         }
-
+        if (cache_flush_bytes > 0) {
+          arr1.CopyFrom(arr2);
+        }
+        DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
         // start timing
         Timer t = Timer::Start(dev);
         for (int j = 0; j < number; ++j) {

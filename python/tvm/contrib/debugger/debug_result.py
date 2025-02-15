@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=pointless-exception-statement, unnecessary-list-index-lookup
 """Graph debug results dumping class."""
 import collections
 import json
@@ -73,21 +74,25 @@ class DebugResult(object):
         """update the nodes_list with name, shape and data type,
         for temporarily storing the output.
         """
-        nodes_len = len(self._nodes_list)
-        for i in range(nodes_len):
-            node = self._nodes_list[i]
+        eid = 0
+        for node in self._nodes_list:
             input_list = []
-            for input_node in node["inputs"]:
-                input_list.append(self._nodes_list[input_node[0]]["name"])
-            node["inputs"] = input_list
-            dtype = str("type: " + self._dtype_list[1][i])
-            if "attrs" not in node:
+            if node["op"] == "null":
                 node["attrs"] = {}
                 node["op"] = "param"
-            else:
+                num_outputs = 1
+            elif node["op"] == "tvm_op":
+                for input_node in node["inputs"]:
+                    input_list.append(self._nodes_list[input_node[0]]["name"])
                 node["op"] = node["attrs"]["func_name"]
+                num_outputs = int(node["attrs"]["num_outputs"])
+            else:
+                raise ValueError("")
+            node["inputs"] = input_list
+            dtype = str("type: " + self._dtype_list[1][eid])
             node["attrs"].update({"T": dtype})
-            node["shape"] = self._shapes_list[1][i]
+            node["shape"] = self._shapes_list[1][eid]
+            eid += num_outputs
 
     def _cleanup_tensors(self):
         """Remove the tensor dump file (graph wont be removed)"""
@@ -145,6 +150,10 @@ class DebugResult(object):
         self._cleanup_tensors()
         output_tensors = self.get_output_tensors()
 
+        np_tensors = {}
+        for key, val in output_tensors.items():
+            np_tensors[key] = val.asnumpy()
+        np.savez(os.path.join(self._dump_path, "output_tensors.npz"), **np_tensors)
         with open(os.path.join(self._dump_path, "output_tensors.params"), "wb") as param_f:
             param_f.write(save_tensors(output_tensors))
 

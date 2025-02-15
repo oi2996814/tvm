@@ -48,6 +48,22 @@
 # - /path/to/cuda: use specific path to cuda toolkit
 set(USE_CUDA OFF)
 
+# Whether to enable NCCL support:
+# - ON: enable NCCL with cmake's auto search
+# - OFF: disable NCCL
+# - /path/to/nccl: use specific path to nccl
+set(USE_NCCL OFF)
+
+# Whether to enable MSCCL support:
+# - ON: enable MSCCL
+# - OFF: disable MSCCL
+set(USE_MSCCL OFF)
+
+# Whether to enable NVTX support (must have USE_CUDA enabled):
+# - ON: enable NCCL with cmake's auto search
+# - OFF: disable NCCL
+set(USE_NVTX OFF)
+
 # Whether enable ROCM runtime
 #
 # Possible values:
@@ -55,6 +71,12 @@ set(USE_CUDA OFF)
 # - OFF: disable ROCM
 # - /path/to/rocm: use specific path to rocm
 set(USE_ROCM OFF)
+
+# Whether to enable RCCL support:
+# - ON: enable RCCL with cmake's auto search
+# - OFF: disable RCCL
+# - /path/to/rccl: use specific path to rccl
+set(USE_RCCL OFF)
 
 # Whether enable SDAccel runtime
 set(USE_SDACCEL OFF)
@@ -65,10 +87,16 @@ set(USE_AOCL OFF)
 # Whether enable OpenCL runtime
 #
 # Possible values:
-# - ON: enable OpenCL with cmake's auto search
+# - ON: enable OpenCL with OpenCL wrapper to remove dependency during build
+#       time and trigger dynamic search and loading of OpenCL in runtime
 # - OFF: disable OpenCL
 # - /path/to/opencl-sdk: use specific path to opencl-sdk
 set(USE_OPENCL OFF)
+
+# Wheather to allow OPENCL cl_mem access to host
+# cl_mem will be allocated with CL_MEM_ALLOC_HOST_PTR
+# OpenCLWorkspace->GetHostPtr API returns the host accessible pointer
+set(USE_OPENCL_ENABLE_HOST_PTR OFF)
 
 # Whether enable Metal runtime
 set(USE_METAL OFF)
@@ -95,14 +123,14 @@ set(USE_SPIRV_KHR_INTEGER_DOT_PRODUCT OFF)
 # Whether enable OpenGL runtime
 set(USE_OPENGL OFF)
 
-# Whether enable MicroTVM runtime
-set(USE_MICRO OFF)
-
 # Whether enable RPC runtime
 set(USE_RPC ON)
 
 # Whether to build the C++ RPC server binary
 set(USE_CPP_RPC OFF)
+
+# Whether to build the C++ native runtime tool binary
+set(USE_CPP_RTVM OFF)
 
 # Whether to build the iOS RPC server application
 set(USE_IOS_RPC OFF)
@@ -122,9 +150,6 @@ set(USE_PIPELINE_EXECUTOR OFF)
 # Whether to enable the profiler for the graph executor and vm
 set(USE_PROFILER ON)
 
-# Whether enable microTVM standalone runtime
-set(USE_MICRO_STANDALONE_RUNTIME OFF)
-
 # Whether build with LLVM support
 # Requires LLVM version >= 4.0
 #
@@ -134,6 +159,10 @@ set(USE_MICRO_STANDALONE_RUNTIME OFF)
 #        which is needed for most cases
 # - /path/to/llvm-config: enable specific LLVM when multiple llvm-dev is available.
 set(USE_LLVM OFF)
+
+# Whether use MLIR to help analyze, requires USE_LLVM is enabled
+# Possible values: ON/OFF
+set(USE_MLIR OFF)
 
 #---------------------------------------------
 # Contrib libraries
@@ -173,6 +202,9 @@ set(USE_MKL OFF)
 # - OFF: Disable DNNL
 set(USE_DNNL OFF)
 
+# Whether use Intel AMX instructions.
+set(USE_AMX OFF)
+
 # Whether use OpenMP thread pool, choices: gnu, intel
 # Note: "gnu" uses gomp library, "intel" uses iomp5 library
 set(USE_OPENMP none)
@@ -207,6 +239,13 @@ set(USE_EDGETPU OFF)
 # - /path/to/cudnn: use specific path to cuDNN path
 set(USE_CUDNN OFF)
 
+# Whether use cuDNN frontend
+# Possible values:
+# - ON: enable cuDNN frontend
+# - /path/to/cudnn_frontend: use specific path to cuDNN frontend
+# - OFF: disable cuDNN frontend
+set(USE_CUDNN_FRONTEND OFF)
+
 # Whether use cuBLAS
 set(USE_CUBLAS OFF)
 
@@ -236,23 +275,6 @@ set(USE_SORT ON)
 set(USE_ARM_COMPUTE_LIB OFF)
 set(USE_ARM_COMPUTE_LIB_GRAPH_EXECUTOR OFF)
 
-# Whether to build with Arm Ethos-N support
-# Possible values:
-# - OFF: disable Arm Ethos-N support
-# - path/to/arm-ethos-N-stack: use a specific version of the
-#   Ethos-N driver stack
-set(USE_ETHOSN OFF)
-# If USE_ETHOSN is enabled, use ETHOSN_HW (ON) if Ethos-N hardware is available on this machine
-# otherwise use ETHOSN_HW (OFF) to use the software test infrastructure
-set(USE_ETHOSN_HW OFF)
-
-# Whether to build with Arm(R) Ethos(TM)-U NPU codegen support
-set(USE_ETHOSU OFF)
-
-# Whether to build with CMSIS-NN external library support.
-# See https://github.com/ARM-software/CMSIS_5
-set(USE_CMSISNN OFF)
-
 # Whether to build with TensorRT codegen or runtime
 # Examples are available here: docs/deploy/tensorrt.rst.
 #
@@ -269,6 +291,9 @@ set(USE_VITIS_AI OFF)
 # Build Verilator codegen and runtime
 set(USE_VERILATOR OFF)
 
+# Whether to use the Multi-System Compiler
+set(USE_MSC OFF)
+
 #Whether to use CLML codegen
 set(USE_CLML OFF)
 # USE_CLML_GRAPH_EXECUTOR - CLML SDK PATH or ON or OFF
@@ -284,6 +309,9 @@ set(USE_ANTLR OFF)
 # Whether use Relay debug mode
 set(USE_RELAY_DEBUG OFF)
 
+# Whether to enable debug code that may cause ABI changes
+set(TVM_DEBUG_WITH_ABI_CHANGE OFF)
+
 # Whether to build fast VTA simulator driver
 set(USE_VTA_FSIM OFF)
 
@@ -294,6 +322,10 @@ set(USE_VTA_TSIM OFF)
 set(USE_VTA_FPGA OFF)
 
 # Whether use Thrust
+# Possible values:
+# - ON: enable Thrust with cmake's auto search
+# - OFF: disable Thrust
+# - /path/to/cccl: use specific path to CCCL
 set(USE_THRUST OFF)
 
 # Whether use cuRAND
@@ -319,8 +351,11 @@ set(USE_HEXAGON_RPC OFF)
 # compiling _by_ TVM). This applies to components like the TVM runtime, but is
 # also used to select correct include/library paths from the Hexagon SDK when
 # building runtime for Android.
-# Valid values are v65, v66, v68, v69.
-set(USE_HEXAGON_ARCH "v66")
+# Valid values are v65, v66, v68, v69, v73, v75.
+set(USE_HEXAGON_ARCH "v68")
+
+# Whether use MRVL codegen
+set(USE_MRVL OFF)
 
 # Whether to use QHL library
 set(USE_HEXAGON_QHL OFF)
@@ -330,19 +365,6 @@ set(USE_TARGET_ONNX OFF)
 
 # Whether enable BNNS runtime
 set(USE_BNNS OFF)
-
-# Whether to use libbacktrace
-# Libbacktrace provides line and column information on stack traces from errors.
-# It is only supported on linux and macOS.
-# Possible values:
-# - AUTO: auto set according to system information and feasibility
-# - ON: enable libbacktrace
-# - OFF: disable libbacktrace
-set(USE_LIBBACKTRACE AUTO)
-
-# Whether to install a signal handler to print a backtrace on segfault. This
-# may replace existing signal handlers specified by other libraries.
-set(BACKTRACE_ON_SEGFAULT OFF)
 
 # Whether to build static libtvm_runtime.a, the default is to build the dynamic
 # version: libtvm_runtime.so.
@@ -366,6 +388,21 @@ set(BUILD_STATIC_RUNTIME OFF)
 # - OFF: disable ccache
 # - /path/to/ccache: use specific path to ccache
 set(USE_CCACHE AUTO)
+
+# Whether to use libbacktrace to supply linenumbers on stack traces.
+# Possible values:
+# - ON: Find libbacktrace from system paths. Report an error if not found.
+# - OFF: Don't use libbacktrace.
+# - /path/to/libbacktrace: Looking for the libbacktrace header and static lib from a user-provided path. Report error if not found.
+# - COMPILE: Build and link to libbacktrace from 3rdparty/libbacktrace.
+# - AUTO:
+#   - Find libbacktrace from system paths.
+#   - If not found, fallback to COMPILE on Linux or MacOS, fallback to OFF on Windows or other platforms.
+set(USE_LIBBACKTRACE AUTO)
+
+# Whether to install a signal handler to print a backtrace on segfault.
+# Need to have USE_LIBBACKTRACE enabled.
+set(BACKTRACE_ON_SEGFAULT OFF)
 
 # Whether to enable PAPI support in profiling. PAPI provides access to hardware
 # counters while profiling.
@@ -391,6 +428,19 @@ set(USE_GTEST AUTO)
 # Need to have USE_CUDA=ON
 set(USE_CUTLASS OFF)
 
+# Whether to enable FlashInfer or not.
+set(USE_FLASHINFER OFF)
+# Options for FlashInfer kernel compilation.
+set(FLASHINFER_ENABLE_FP8 OFF)
+set(FLASHINFER_ENABLE_BF16 OFF)
+set(FLASHINFER_GEN_GROUP_SIZES 1 4 6 8)
+set(FLASHINFER_GEN_PAGE_SIZES 16)
+set(FLASHINFER_GEN_HEAD_DIMS 128)
+set(FLASHINFER_GEN_KV_LAYOUTS 0 1)
+set(FLASHINFER_GEN_POS_ENCODING_MODES 0 1)
+set(FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS "false")
+set(FLASHINFER_GEN_CASUALS "false" "true")
+
 # Enable to show a summary of TVM options
 set(SUMMARIZE OFF)
 
@@ -401,3 +451,15 @@ set(USE_LIBTORCH OFF)
 
 # Whether to use the Universal Modular Accelerator Interface
 set(USE_UMA OFF)
+
+# Set custom Alloc Alignment for device allocated memory ndarray points to
+set(USE_KALLOC_ALIGNMENT 64)
+
+# Set Windows Visual Studio default Architecture (equivalent to -A x64)
+SET(CMAKE_VS_PLATFORM_NAME_DEFAULT "x64")
+
+# Set Windows Visual Studio default host (equivalent to -Thost=x64)
+SET(CMAKE_VS_PLATFORM_TOOLSET_HOST_ARCHITECTURE "x64")
+
+# Enable Qualcomm OpenCL extension support
+set(USE_OPENCL_EXTN_QCOM OFF)

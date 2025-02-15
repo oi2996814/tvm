@@ -21,6 +21,7 @@
 
 #include <tvm/ir/expr.h>
 #include <tvm/ir/function.h>
+#include <tvm/ir/module.h>
 #include <tvm/node/node.h>
 #include <tvm/script/ir_builder/base.h>
 
@@ -38,13 +39,24 @@ namespace ir {
  */
 class IRModuleFrameNode : public IRBuilderFrameNode {
  public:
-  Array<GlobalVar> global_vars;
-  Array<BaseFunc> functions;
+  /*! \brief A map from string names to global variables that ensures global uniqueness. */
+  Map<String, GlobalVar> global_var_map;
+  /*!
+   * \brief A map from GlobalVar to all global functions.
+   * \note Only defined functions are in the map, while declared functions are not included.
+   */
+  Map<GlobalVar, BaseFunc> functions;
+  /*! \brief IRModule's attributes. */
+  Map<String, ObjectRef> attrs;
+  /*! \brief IRModule's global_infos */
+  Map<String, Array<GlobalInfo>> global_infos;
 
   void VisitAttrs(tvm::AttrVisitor* v) {
     IRBuilderFrameNode::VisitAttrs(v);
-    v->Visit("global_vars", &global_vars);
+    v->Visit("global_vars", &global_var_map);
     v->Visit("functions", &functions);
+    v->Visit("attrs", &attrs);
+    v->Visit("global_infos", &global_infos);
   }
 
   static constexpr const char* _type_key = "script.ir_builder.IRModuleFrame";

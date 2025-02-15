@@ -51,14 +51,27 @@ def _create_args(mod: IRModule, dev: Device, func_name: str = "main", remote=Non
 
 @pass_instrument
 class SaveLoweredTIR:
-    """Save TIR functions from right before final lowering. Right now this
-    means right before tir.MakePackedAPI."""
+    """Save TIR functions for analysis.
 
-    def __init__(self):
+    We need the TIR function in a form that can be handled by
+    `auto_scheduler.feature.named_features_from_primfunc`, but which
+    is the closest to the final lowered form as possible.  Right now this
+    means right before tir.SplitHostDevice.
+
+    """
+
+    def __init__(self, before_pass: str = "tir.SplitHostDevice"):
+        """
+        Parameters
+        ----------
+        before_pass: str
+            Pass before which the TIR is saved.
+        """
         self.functions = {}
+        self.before_pass = before_pass
 
     def run_before_pass(self, mod, info):
-        if info.name == "tir.MakePackedAPI":
+        if info.name == self.before_pass:
             for v, func in mod.functions.items():
                 if isinstance(func, tir.PrimFunc):
                     self.functions[v] = func
@@ -138,10 +151,13 @@ def roofline_from_existing(
         if isinstance(prim, tir.PrimFunc) and "hash" in prim.attrs.keys()
     }
 
+    new_configuration = dict(report.configuration.items())
     new_calls = []
     for call in report.calls:
         if "Hash" in call.keys() and call["Hash"] in all_features:
             _, prim, features = all_features[call["Hash"]]
+            if features is None:
+                continue
 
             with target:
                 flops, peak_flops, flops_name = registry.estimate_peak_flops(
@@ -150,6 +166,10 @@ def roofline_from_existing(
                 loaded_bytes, peak_bandwidth, bandwidth_name = registry.estimate_peak_bandwidth(
                     prim, features, target, dev, remote
                 )
+            new_configuration[f"Estimated Peak FLOP/s ({flops_name})"] = profiling.Ratio(peak_flops)
+            new_configuration[
+                f"Estimated Peak Bandwidth ({bandwidth_name}, byte/second)"
+            ] = profiling.Ratio(peak_bandwidth)
             ridge_point = peak_flops / peak_bandwidth
 
             runtime = call["Duration (us)"].microseconds * 1e-6
@@ -171,11 +191,6 @@ def roofline_from_existing(
             new_calls.append(call)
         else:
             new_calls.append(call)
-    new_configuration = dict(report.configuration.items())
-    new_configuration[f"Estimated Peak FLOP/s ({flops_name})"] = profiling.Ratio(peak_flops)
-    new_configuration[
-        f"Estimated Peak Bandwidth ({bandwidth_name}, byte/second)"
-    ] = profiling.Ratio(peak_bandwidth)
     return profiling.Report(new_calls, report.device_metrics, new_configuration)
 
 

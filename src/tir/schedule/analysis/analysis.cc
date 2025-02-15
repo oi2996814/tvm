@@ -46,47 +46,6 @@ const PrimFuncNode* GetRootPrimFunc(const IRModule& mod, const StmtNode* root_bl
   throw;
 }
 
-const PrimFuncNode* FindEntryFunc(const IRModule& mod, GlobalVar* result_g_var) {
-  GlobalVar result = NullValue<GlobalVar>();
-  // Priority 1: PrimFunc marked as `tir::attr::kIsEntryFunc`
-  int num_prim_func = 0;
-  const tir::PrimFuncNode* main_func = nullptr;
-  const tir::PrimFuncNode* last_func = nullptr;
-  for (const auto& kv : mod->functions) {
-    GlobalVar gv = kv.first;
-    BaseFunc base_func = kv.second;
-    if (const auto* func = base_func.as<tir::PrimFuncNode>()) {
-      last_func = func;
-      if (func->HasNonzeroAttr(tir::attr::kIsEntryFunc)) {
-        if (result_g_var != nullptr) {
-          *result_g_var = gv;
-        }
-        return func;
-      }
-      if (gv->name_hint == "main") {
-        main_func = func;
-        result = gv;
-      }
-      ++num_prim_func;
-    }
-  }
-  // Priority 2: PrimFunc whose name is `main`
-  if (main_func != nullptr) {
-    if (result_g_var != nullptr) {
-      *result_g_var = result;
-    }
-    return main_func;
-  }
-  // Priority 3: The only PrimFunc in the IRModule
-  if (num_prim_func == 1) {
-    if (result_g_var != nullptr) {
-      *result_g_var = result;
-    }
-    return last_func;
-  }
-  return nullptr;
-}
-
 /******** Scope ********/
 
 StmtSRef GetScopeRoot(const ScheduleState& self, const StmtSRef& sref,
@@ -144,8 +103,8 @@ Definition of a scope that is a stage pipeline:
     }
   }
   // Step 2. Handle `require_stage_pipeline`
-  if (require_stage_pipeline) {
-    bool stage_pipeline = self->GetBlockInfo(scope_root_sref).scope->stage_pipeline;
+  if (require_stage_pipeline && self->enable_check) {
+    bool stage_pipeline = self->GetBlockInfo(scope_root_sref).stage_pipeline;
     if (stage_pipeline == false) {
       const BlockNode* block = TVM_SREF_TO_BLOCK(scope_root_sref);
       throw NotStagePipelineError(self->mod, GetRef<Block>(block));
@@ -369,6 +328,11 @@ bool IsReductionBlock(const ScheduleState& self, const StmtSRef& block_sref,
   return CheckReductionBlockErrorCode(self, block_sref, scope_root_sref) == 0;
 }
 
+TVM_REGISTER_GLOBAL("tir.schedule.IsReductionBlock")
+    .set_body_typed([](Schedule sch, BlockRV block_rv, BlockRV scope_block_rv) {
+      return IsReductionBlock(sch->state(), sch->GetSRef(block_rv), sch->GetSRef(scope_block_rv));
+    });
+
 void CheckReductionBlock(const ScheduleState& self, const StmtSRef& block_sref,
                          const StmtSRef& scope_root_sref) {
   class NotReductionBlockError : public ScheduleError {
@@ -581,7 +545,8 @@ bool IsAffineBinding(const BlockRealize& realize, const Map<Var, Range>& loop_va
       /*input_iters=*/loop_var_ranges,
       /*predicate=*/realize->predicate,
       /*check_level=*/arith::IterMapLevel::Surjective,
-      /*analyzer=*/analyzer);
+      /*analyzer=*/analyzer,
+      /*simplify_trivial_iterators=*/false);
   if (res->indices.empty()) {
     return false;
   }
@@ -899,6 +864,11 @@ BlockRealize GetBlockRealize(const ScheduleState& self, const StmtSRef& block_sr
   }
 }
 
+TVM_REGISTER_GLOBAL("tir.schedule.GetBlockRealize")
+    .set_body_typed([](Schedule sch, BlockRV block_rv) {
+      return GetBlockRealize(sch->state(), sch->GetSRef(block_rv));
+    });
+
 IterVarType GetLoopIterType(const StmtSRef& loop_sref) {
   const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
   const Var& loop_var = loop->loop_var;
@@ -1054,23 +1024,60 @@ std::pair<Array<StmtSRef>, std::vector<int>> CollectComputeLocation(const Schedu
 /******** Producer-consumer relation ********/
 
 Array<StmtSRef> GetProducers(const StmtSRef& block_sref, const BlockScope& scope) {
-  Array<Dependency> deps = scope->GetDepsByDst(block_sref);
-  Array<StmtSRef> result;
-  result.reserve(deps.size());
-  for (const Dependency& dep : deps) {
-    result.push_back(dep->src);
+  Array<Dependency> edges = scope->GetDepsByDst(block_sref);
+  Array<StmtSRef> results;
+  std::unordered_set<StmtSRef, ObjectPtrHash, ObjectPtrEqual> result_set;
+  results.reserve(edges.size());
+  for (const Dependency& edge : edges) {
+    if ((edge->kind == DepKind::kRAW || edge->kind == DepKind::kWAW) &&
+        !result_set.count(edge->src)) {
+      results.push_back(edge->src);
+      result_set.emplace(edge->src);
+    }
   }
-  return result;
+  return results;
 }
 
 Array<StmtSRef> GetConsumers(const StmtSRef& block_sref, const BlockScope& scope) {
-  Array<Dependency> deps = scope->GetDepsBySrc(block_sref);
-  Array<StmtSRef> result;
-  result.reserve(deps.size());
-  for (const Dependency& dep : deps) {
-    result.push_back(dep->dst);
+  Array<Dependency> edges = scope->GetDepsBySrc(block_sref);
+  Array<StmtSRef> results;
+  std::unordered_set<StmtSRef, ObjectPtrHash, ObjectPtrEqual> result_set;
+  results.reserve(edges.size());
+  for (const Dependency& edge : edges) {
+    if ((edge->kind == DepKind::kRAW || edge->kind == DepKind::kWAW) &&
+        !result_set.count(edge->dst)) {
+      results.push_back(edge->dst);
+      result_set.emplace(edge->dst);
+    }
   }
-  return result;
+  return results;
+}
+
+Array<StmtSRef> GetOutputBlocks(const ScheduleState& self, const BlockNode* scope_block) {
+  struct OutputBlockCollector : public StmtVisitor {
+    explicit OutputBlockCollector(const ScheduleState& self) : self_(self) {}
+
+    void VisitStmt_(const BlockNode* block) override {
+      auto it = self_->stmt2ref.find(block);
+      ICHECK(it != self_->stmt2ref.end());
+      auto block_sref = it->second;
+      if (block_sref->parent != nullptr) {
+        StmtSRef scope_root_sref =
+            GetScopeRoot(self_, block_sref, /*require_stage_pipeline=*/false);
+        if (IsOutputBlock(self_, block_sref, scope_root_sref)) {
+          results_.push_back(block_sref);
+        }
+      }
+      StmtVisitor::VisitStmt_(block);
+    }
+
+    const ScheduleState& self_;
+    Array<StmtSRef> results_;
+  };
+  OutputBlockCollector collector(self);
+  collector(scope_block->body);
+  auto results = collector.results_;
+  return results;
 }
 
 ProducerConsumerSplit ProducerConsumerSplit::Find(
@@ -1272,6 +1279,20 @@ StmtSRef GetSRefTreeRoot(const StmtSRef& sref) {
   return GetRef<StmtSRef>(p);
 }
 
+void AddShapeVarBounds(const ScheduleState& state, const StmtSRefNode* sref,
+                       arith::Analyzer* analyzer) {
+  while (sref->parent != nullptr) {
+    sref = sref->parent;
+  }
+  const PrimFuncNode* f = GetRootPrimFunc(state->mod, sref->stmt, nullptr);
+  for (const auto& kv : f->buffer_map) {
+    const Buffer& buffer = kv.second;
+    for (const PrimExpr& e : buffer->shape) {
+      analyzer->MarkGlobalNonNegValue(e);
+    }
+  }
+}
+
 /******** Misc ********/
 
 bool HasOp(const Stmt& stmt, const Array<Op>& ops) {
@@ -1462,6 +1483,11 @@ bool IsTrivialBinding(const ScheduleState& self, const StmtSRef& block_sref) {
   return true;
 }
 
+TVM_REGISTER_GLOBAL("tir.schedule.IsTrivialBinding")
+    .set_body_typed([](Schedule sch, BlockRV block_rv) {
+      return IsTrivialBinding(sch->state(), sch->GetSRef(block_rv));
+    });
+
 bool NeedsMultiLevelTiling(const ScheduleState& self, const StmtSRef& block_sref) {
   if (HasBeenMultiLevelTiled(block_sref)) {
     return false;
@@ -1555,14 +1581,14 @@ std::pair<int64_t, int64_t> GetCumulativeSpaceAndReductionLength(const tir::Sche
     tir::IterVarType type = GetLoopIterType(loop_sref);
     if (type == tir::kDataPar) {
       const int64_t* extent = GetLoopIntExtent(loop_sref);
-      if (*extent != -1) {
+      if (extent && *extent != -1) {
         cum_space_len *= *extent;
       } else {
         return std::make_pair(-1, -1);
       }
     } else if (type == tir::kCommReduce) {
       const int64_t* extent = GetLoopIntExtent(loop_sref);
-      if (*extent != -1) {
+      if (extent && *extent != -1) {
         cum_reduce_len *= *extent;
       } else {
         return std::make_pair(-1, -1);
@@ -1832,7 +1858,7 @@ Optional<TensorizeInfo> GetTensorizeLoopMapping(const tir::ScheduleState& self,
         if (allow_padding) {
           // If the block loop is not divisible by the desc loop, we pad the block loop to make it
           // divisible if padding is allowed.
-          block_index_to_padding[current_block_ind] = int_desc_extent->value - remainder;
+          block_index_to_padding[current_block_ind] = int_desc_extent->value;
         } else {
           return NullOpt;
         }
@@ -1856,7 +1882,7 @@ Optional<TensorizeInfo> GetTensorizeLoopMapping(const tir::ScheduleState& self,
       if (auto it = block_index_to_padding.find(i); it != block_index_to_padding.end()) {
         paddings.push_back(IntImm(iter_var->var.dtype(), it->second));
       } else {
-        paddings.push_back(IntImm(iter_var->var.dtype(), 0));
+        paddings.push_back(IntImm(iter_var->var.dtype(), 1));
       }
     }
     ret->block_iter_paddings = std::move(paddings);
@@ -1888,7 +1914,7 @@ class AutoTensorizeMappingProposer {
                                         arith::Analyzer* analyzer)
       : extractor_(extractor), analyzer_(analyzer) {}
 
-  using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
+  using VarSet = std::unordered_set<Var>;
 
   void CollectFeasibleSet() {
     // Collect the set of potential iter var mapping between the workload and the tensor intrin.
@@ -2050,7 +2076,7 @@ class AutoTensorizeMappingProposer {
   // The arithmetic analyzer.
   arith::Analyzer* analyzer_;
   /*! \brief Potential mappings on RHS for each variable on LHS */
-  std::unordered_map<Var, VarSet, ObjectPtrHash, ObjectPtrEqual> lhs_feasible_vars_;
+  std::unordered_map<Var, VarSet> lhs_feasible_vars_;
 };
 
 bool CheckAutoTensorizeApplicable(const ScheduleState& state, const tir::StmtSRef& block_sref,
@@ -2098,6 +2124,25 @@ TVM_REGISTER_NODE_TYPE(AutoTensorizeMappingInfoNode);
 TVM_REGISTER_GLOBAL("tir.schedule.GetAutoTensorizeMappingInfo")
     .set_body_typed([](Schedule sch, BlockRV block, PrimFunc desc_func) {
       return GetAutoTensorizeMappingInfo(sch->state(), sch->GetSRef(block), desc_func);
+    });
+
+TVM_REGISTER_GLOBAL("tir.schedule.HasBlock").set_body_typed(HasBlock);
+TVM_REGISTER_GLOBAL("tir.schedule.IsOutputBlock").set_body_typed([](Schedule sch, BlockRV block) {
+  auto state = sch->state();
+  auto block_sref = sch->GetSRef(block);
+  return IsOutputBlock(state, block_sref, GetScopeRoot(state, block_sref, false));
+});
+
+TVM_REGISTER_GLOBAL("tir.schedule.GetLoopIterType")
+    .set_body_typed([](Schedule sch, LoopRV loop) -> String {
+      IterVarType kind = GetLoopIterType(sch->GetSRef(loop));
+      if (kind == kDataPar) {
+        return "S";
+      } else if (kind == kCommReduce) {
+        return "R";
+      } else {
+        return "O";
+      }
     });
 
 }  // namespace tir

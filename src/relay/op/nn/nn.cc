@@ -193,6 +193,7 @@ RELAY_REGISTER_OP("nn.matmul")
     .add_argument("tensor_a", "nD Tensor", "The first input Tensor.")
     .add_argument("tensor_b", "2D Tensor", "The second input Tensor.")
     .set_support_level(1)
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", DenseInferCorrectLayout)
     .add_type_rel("Matmul", MatmulRel<MatmulAttrs>)
     .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
@@ -923,6 +924,7 @@ bool InstanceNormRel(const Array<Type>& types, int num_inputs, const Attrs& attr
   ICHECK_EQ(types.size(), 4);
   const auto* data = types[0].as<TensorTypeNode>();
   if (data == nullptr) return false;
+  ICHECK_GT(data->shape.size(), 2);
   const InstanceNormAttrs* param = attrs.as<InstanceNormAttrs>();
   int axis = param->axis >= 0 ? param->axis : param->axis + data->shape.size();
   ICHECK(axis >= 0 && axis < (int)data->shape.size());
