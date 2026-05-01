@@ -836,6 +836,84 @@ def test_square():
     verify(TfInput, Expected)
 
 
+def test_broadcast_args():
+    class TfInput(tf.Module):
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(shape=(3,), dtype=tf.int32),
+                tf.TensorSpec(shape=(3,), dtype=tf.int32),
+            ]
+        )
+        def func(self, s0, s1):
+            return tf.broadcast_dynamic_shape(s0, s1)
+
+    @I.ir_module
+    class Expected:
+        @R.function
+        def main(
+            s0: R.Tensor((3,), dtype="int32"), s1: R.Tensor((3,), dtype="int32")
+        ) -> R.Tensor((3,), dtype="int32"):
+            R.func_attr({"num_input": 2})
+            with R.dataflow():
+                lv: R.Tensor((0,), dtype="int32") = R.full(
+                    R.shape([0]), R.const(1, "int32"), dtype="int32"
+                )
+                lv1: R.Tensor((3,), dtype="int32") = R.concat((lv, s0), axis=0)
+                lv2: R.Tensor((3,), dtype="bool") = R.equal(lv1, R.const(1, "int32"))
+                lv3: R.Tensor((0,), dtype="int32") = R.full(
+                    R.shape([0]), R.const(1, "int32"), dtype="int32"
+                )
+                lv4: R.Tensor((3,), dtype="int32") = R.concat((lv3, s1), axis=0)
+                lv5: R.Tensor((3,), dtype="bool") = R.equal(lv4, R.const(1, "int32"))
+                lv6: R.Tensor((3,), dtype="int32") = R.maximum(lv1, lv4)
+                lv7: R.Tensor((3,), dtype="int32") = R.where(lv5, lv1, lv6)
+                gv: R.Tensor((3,), dtype="int32") = R.where(lv2, lv4, lv7)
+                R.output(gv)
+            return gv
+
+    verify(TfInput, Expected)
+
+
+def test_broadcast_args_diff_length():
+    """BROADCAST_ARGS with shape inputs of different lengths."""
+
+    class TfInput(tf.Module):
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(shape=(1,), dtype=tf.int32),
+                tf.TensorSpec(shape=(3,), dtype=tf.int32),
+            ]
+        )
+        def func(self, s0, s1):
+            return tf.broadcast_dynamic_shape(s0, s1)
+
+    @I.ir_module
+    class Expected:
+        @R.function
+        def main(
+            s0: R.Tensor((1,), dtype="int32"), s1: R.Tensor((3,), dtype="int32")
+        ) -> R.Tensor((3,), dtype="int32"):
+            R.func_attr({"num_input": 2})
+            with R.dataflow():
+                lv: R.Tensor((2,), dtype="int32") = R.full(
+                    R.shape([2]), R.const(1, "int32"), dtype="int32"
+                )
+                lv1: R.Tensor((3,), dtype="int32") = R.concat((lv, s0), axis=0)
+                lv2: R.Tensor((3,), dtype="bool") = R.equal(lv1, R.const(1, "int32"))
+                lv3: R.Tensor((0,), dtype="int32") = R.full(
+                    R.shape([0]), R.const(1, "int32"), dtype="int32"
+                )
+                lv4: R.Tensor((3,), dtype="int32") = R.concat((lv3, s1), axis=0)
+                lv5: R.Tensor((3,), dtype="bool") = R.equal(lv4, R.const(1, "int32"))
+                lv6: R.Tensor((3,), dtype="int32") = R.maximum(lv1, lv4)
+                lv7: R.Tensor((3,), dtype="int32") = R.where(lv5, lv1, lv6)
+                gv: R.Tensor((3,), dtype="int32") = R.where(lv2, lv4, lv7)
+                R.output(gv)
+            return gv
+
+    verify(TfInput, Expected)
+
+
 @pytest.mark.parametrize(
     "tf_op, relax_op",
     [

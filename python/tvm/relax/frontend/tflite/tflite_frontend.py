@@ -126,6 +126,7 @@ class OperatorConverter:
             "BATCH_TO_SPACE_ND": self.convert_batch_to_space_nd,
             "BATCH_MATMUL": self.convert_batch_matmul,
             "BITCAST": self.convert_bitcast,
+            "BROADCAST_ARGS": self.convert_broadcast_args,
             "CAST": self.convert_cast,
             "CEIL": functools.partial(self._convert_unary_elemwise, relax_op=_op.ceil),
             "CONCATENATION": self.convert_concatenation,
@@ -2509,6 +2510,37 @@ class OperatorConverter:
         )
 
         return relax.op.memory.view(in_expr, shape=output_shape, dtype=output_dtype)
+
+    def convert_broadcast_args(self, op):
+        """Convert TFLite BROADCAST_ARGS"""
+        input_tensors = self.get_input_tensors(op)
+        output_tensors = self.get_output_tensors(op)
+        assert len(input_tensors) == 2, "input tensors length should be 2"
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+
+        s0 = self.get_tensor_expr(input_tensors[0])
+        s1 = self.get_tensor_expr(input_tensors[1])
+        s0_len = to_int_list(self.get_tensor_shape(input_tensors[0]))[0]
+        s1_len = to_int_list(self.get_tensor_shape(input_tensors[1]))[0]
+        out_dtype = self.get_tensor_type_str(input_tensors[0].tensor.Type())
+
+        # Left-pad the shorter input with 1s to length target_len.
+        target_len = tirx.max(s0_len, s1_len)
+        one = relax.const(1, dtype=out_dtype)
+        s0 = relax.op.concat(
+            [relax.op.full([target_len - s0_len], one, dtype=out_dtype), s0], axis=0
+        )
+        s1 = relax.op.concat(
+            [relax.op.full([target_len - s1_len], one, dtype=out_dtype), s1], axis=0
+        )
+        # Per-dim broadcast. If either side is 1 take the other, else elementwise max.
+        s0_is_one = relax.op.equal(s0, one)
+        s1_is_one = relax.op.equal(s1, one)
+        return relax.op.where(
+            s0_is_one,
+            s1,
+            relax.op.where(s1_is_one, s0, relax.op.maximum(s0, s1)),
+        )
 
     def convert_cast(self, op):
         """Convert TFLite CAST"""
