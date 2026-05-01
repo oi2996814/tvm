@@ -121,6 +121,7 @@ class OperatorConverter:
             "ADD_N": self.convert_add_n,
             "ARG_MAX": functools.partial(self._convert_arg_min_max, relax_op=_op.argmax),
             "ARG_MIN": functools.partial(self._convert_arg_min_max, relax_op=_op.argmin),
+            "ATAN2": functools.partial(self._convert_elemwise, relax_op=_op.atan2),
             "AVERAGE_POOL_2D": functools.partial(self.convert_pool2d, pool_type="average"),
             "BATCH_TO_SPACE_ND": self.convert_batch_to_space_nd,
             "BATCH_MATMUL": self.convert_batch_matmul,

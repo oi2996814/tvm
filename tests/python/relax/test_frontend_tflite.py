@@ -769,6 +769,7 @@ def test_fill_dynamic_dims():
         (tf.divide, R.divide),
         (tf.math.floormod, R.floor_mod),
         (tf.math.floordiv, R.floor_divide),
+        (tf.math.atan2, R.atan2),
     ],
 )
 def test_binary(tf_op, relax_op):
