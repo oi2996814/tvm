@@ -94,6 +94,42 @@ def verify(TestClass, expected=None):
         np.testing.assert_allclose(tf_output.numpy(), tvm_output.numpy(), rtol=1e-5, atol=1e-5)
 
 
+def _verify_random_with_inputs(cfunc, inputs):
+    """E2E verify random ops by shape/dtype and TVM seeded self-consistency."""
+    if "CI_ENV_NIGHTLY" not in os.environ:
+        return
+
+    mod = _get_mod_from_cfunc(cfunc)
+    tvm_inputs = [np.asarray(data) for data in inputs]
+    tf_inputs = [tf.constant(data) for data in tvm_inputs]
+
+    tf_output = cfunc(*tf_inputs)
+
+    tgt = tvm.target.Target("llvm")
+    ex = tvm.compile(mod, tgt)
+    vm = relax.VirtualMachine(ex, tvm.cpu())
+
+    def run_tvm():
+        vm.set_input("main", *tvm_inputs)
+        vm.invoke_stateful("main")
+        return vm.get_outputs("main")
+
+    tvm_output = run_tvm()
+    tvm_output_again = run_tvm()
+
+    if not isinstance(tf_output, tuple):
+        tf_output = (tf_output,)
+        tvm_output = (tvm_output,)
+        tvm_output_again = (tvm_output_again,)
+
+    for tf_out, tvm_out, tvm_out_again in zip(tf_output, tvm_output, tvm_output_again):
+        tf_np = tf_out.numpy()
+        tvm_np = tvm_out.numpy()
+        assert tvm_np.shape == tf_np.shape
+        assert tvm_np.dtype == tf_np.dtype
+        np.testing.assert_equal(tvm_np, tvm_out_again.numpy())
+
+
 def test_add_one_2d():
     class AddOne2D(tf.Module):
         @tf.function(input_signature=[tf.TensorSpec(shape=(2, 2), dtype=tf.float32)])
@@ -758,6 +794,79 @@ def test_fill_dynamic_dims():
     assert "R.full" in ir
     tvm.compile(mod, tvm.target.Target("llvm"))
     verify(cf)
+
+
+def test_random_uniform_dynamic_shape():
+    """RANDOM_UNIFORM imports dynamic shape and validates random output metadata."""
+
+    class TfRandomUniform(tf.Module):
+        @tf.function(input_signature=[tf.TensorSpec(shape=(2,), dtype=tf.int32)])
+        def func(self, shape):
+            return tf.raw_ops.RandomUniform(shape=shape, dtype=tf.float32, seed=7, seed2=11)
+
+    cf = TfRandomUniform().func.get_concrete_function()
+    mod = _get_mod_from_cfunc(cf)
+    ir = mod.script()
+    assert "R.tensor_to_shape" in ir
+    assert 'R.call_dps_packed("tvm.contrib.random.uniform"' in ir
+
+    _verify_random_with_inputs(cf, [np.array([2, 3], dtype="int32")])
+
+
+def test_random_standard_normal_dynamic_shape():
+    """RANDOM_STANDARD_NORMAL imports dynamic shape and validates random output metadata."""
+
+    class TfRandomStandardNormal(tf.Module):
+        @tf.function(input_signature=[tf.TensorSpec(shape=(2,), dtype=tf.int32)])
+        def func(self, shape):
+            return tf.raw_ops.RandomStandardNormal(
+                shape=shape, dtype=tf.float32, seed=3, seed2=5
+            )
+
+    cf = TfRandomStandardNormal().func.get_concrete_function()
+    mod = _get_mod_from_cfunc(cf)
+    ir = mod.script()
+    assert "R.tensor_to_shape" in ir
+    assert 'R.call_dps_packed("tvm.contrib.random.normal"' in ir
+
+    _verify_random_with_inputs(cf, [np.array([2, 4], dtype="int32")])
+
+
+def test_multinomial_dynamic_num_samples():
+    """MULTINOMIAL lowers through seeded uniform sampling with dynamic num_samples."""
+
+    class TfMultinomial(tf.Module):
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(shape=(2, 3), dtype=tf.float32),
+                tf.TensorSpec(shape=(), dtype=tf.int32),
+            ]
+        )
+        def func(self, logits, num_samples):
+            return tf.raw_ops.Multinomial(
+                logits=logits,
+                num_samples=num_samples,
+                output_dtype=tf.int64,
+                seed=13,
+                seed2=17,
+            )
+
+    cf = TfMultinomial().func.get_concrete_function()
+    mod = _get_mod_from_cfunc(cf)
+    ir = mod.script()
+    assert "R.nn.softmax" in ir
+    assert "R.multinomial_from_uniform" in ir
+    assert "R.tensor_to_shape" in ir
+    assert "multinomial_num_samples" in ir
+    assert 'R.call_dps_packed("tvm.contrib.random.uniform"' in ir
+
+    _verify_random_with_inputs(
+        cf,
+        [
+            np.array([[2.0, 1.0, 0.5], [0.1, 0.2, 3.0]], dtype="float32"),
+            np.array(4, dtype="int32"),
+        ],
+    )
 
 
 @pytest.mark.parametrize(

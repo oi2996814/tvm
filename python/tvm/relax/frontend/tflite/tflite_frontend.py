@@ -188,6 +188,7 @@ class OperatorConverter:
             "MINIMUM": functools.partial(self._convert_elemwise, relax_op=_op.minimum),
             "MIRROR_PAD": self.convert_mirror_pad,
             "MUL": functools.partial(self._convert_elemwise, relax_op=_op.multiply),
+            "MULTINOMIAL": self.convert_multinomial,
             "NEG": functools.partial(self._convert_unary_elemwise, relax_op=_op.negative),
             "NOT_EQUAL": functools.partial(
                 self._convert_elemwise, relax_op=_op.not_equal, comparison_op=True
@@ -200,6 +201,8 @@ class OperatorConverter:
             "PRELU": self.convert_prelu,
             "RANGE": self.convert_range,
             "QUANTIZE": self.convert_quantize,
+            "RANDOM_STANDARD_NORMAL": self.convert_random_standard_normal,
+            "RANDOM_UNIFORM": self.convert_random_uniform,
             "REDUCE_ALL": functools.partial(self._convert_reduce_bool, relax_op=_op.min),
             "REDUCE_ANY": functools.partial(self._convert_reduce_bool, relax_op=_op.max),
             "REDUCE_MAX": functools.partial(self._convert_reduce, relax_op=_op.max),
@@ -541,6 +544,22 @@ class OperatorConverter:
         if tensor_type == TensorType.BOOL:
             return "bool"
         raise NotImplementedError(f"Tensor type {tensor_type!s} is currently not supported")
+
+    def _get_shape_expr_from_tensor(self, shape_tensor, prefix):
+        """Convert a TFLite shape tensor to a Relax shape expression."""
+        if self.has_expr(shape_tensor.tensor_idx):
+            dims_expr = self.get_expr(shape_tensor.tensor_idx)
+            dims_ndim = int(self.get_tensor_shape(shape_tensor)[0])
+            dims_dtype = self.get_tensor_type_str(shape_tensor.tensor.Type())
+            dims_expr = self.bb.match_cast(dims_expr, relax.TensorStructInfo([dims_ndim], dims_dtype))
+            dims_expr = self.bb.normalize(relax.op.astype(dims_expr, "int64"))
+            shape_dataflow_var = self.bb.emit(relax.op.tensor_to_shape(dims_expr))
+            shape_vars = [tirx.Var(f"{prefix}_{i}", "int64") for i in range(dims_ndim)]
+            self.bb.match_cast(shape_dataflow_var, relax.ShapeStructInfo(shape_vars))
+            return relax.ShapeExpr(shape_vars), shape_vars
+
+        dims = to_int_list(self.get_tensor_value(shape_tensor))
+        return dims, dims
 
     def flatten_to_nd(self, x, nd=3):
         """Flatten input tensor to nd rank"""
@@ -1783,23 +1802,129 @@ class OperatorConverter:
         dims_tensor = input_tensors[0]
         in_value_expr = self.get_expr(input_tensors[1].tensor_idx)
 
-        if self.has_expr(dims_tensor.tensor_idx):
-            dims_expr = self.get_expr(dims_tensor.tensor_idx)
-            dims_ndim = int(self.get_tensor_shape(dims_tensor)[0])
-
-            # Bind runtime dims to fresh symbolic shape vars so the imported
-            # module remains well formed before LegalizeOps runs.
-            dims_expr = self.bb.match_cast(dims_expr, relax.TensorStructInfo([dims_ndim], "int32"))
-            dims_expr = self.bb.normalize(relax.op.astype(dims_expr, "int64"))
-            shape_dataflow_var = self.bb.emit(relax.op.tensor_to_shape(dims_expr))
-            shape_vars = [tirx.Var(f"fill_dim_{i}", "int64") for i in range(dims_ndim)]
-            self.bb.match_cast(shape_dataflow_var, relax.ShapeStructInfo(shape_vars))
-            out = relax.op.full(relax.ShapeExpr(shape_vars), in_value_expr)
-        else:
-            in_dims = list(self.get_tensor_value(dims_tensor))
-            out = relax.op.full(in_dims, in_value_expr)
+        out_shape, _ = self._get_shape_expr_from_tensor(dims_tensor, "fill_dim")
+        out = relax.op.full(out_shape, in_value_expr)
 
         return out
+
+    def _get_random_options(self, op):
+        """Return the seed pair for random TFLite operators.
+
+        The runtime imports seeded TFLite random ops with stateless semantics, so identical
+        non-zero seed pairs produce identical results on every invocation. The seed pair
+        (0, 0) is forwarded as the TF non-deterministic case.
+        """
+        from tflite.BuiltinOptions import BuiltinOptions
+        from tflite.RandomOptions import RandomOptions
+
+        if op.BuiltinOptionsType():
+            assert op.BuiltinOptionsType() == BuiltinOptions.RandomOptions
+            random_options = RandomOptions()
+            op_options = op.BuiltinOptions()
+            random_options.Init(op_options.Bytes, op_options.Pos)
+            return int(random_options.Seed()), int(random_options.Seed2())
+        return 0, 0
+
+    def _check_random_output_dtype(self, op_name, output_dtype, supported_dtypes):
+        if output_dtype not in supported_dtypes:
+            supported = ", ".join(supported_dtypes)
+            raise tvm.error.OpNotImplemented(
+                f"The TFLite {op_name} converter currently supports output dtype(s) "
+                f"{supported} only, but got {output_dtype}."
+            )
+
+    def convert_random_uniform(self, op):
+        """Convert TFLite RANDOM_UNIFORM using stateless seeded RNG semantics."""
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 1, "input tensors length should be 1"
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_dtype = self.get_tensor_type_str(output_tensor.tensor.Type())
+        self._check_random_output_dtype("RANDOM_UNIFORM", output_dtype, ["float32"])
+
+        out_shape, _ = self._get_shape_expr_from_tensor(input_tensors[0], "random_uniform_dim")
+        seed, seed2 = self._get_random_options(op)
+        return relax.op.call_dps_packed(
+            "tvm.contrib.random.uniform",
+            (seed, seed2, 0.0, 1.0),
+            out_sinfo=relax.TensorStructInfo(out_shape, output_dtype),
+        )
+
+    def convert_random_standard_normal(self, op):
+        """Convert TFLite RANDOM_STANDARD_NORMAL using stateless seeded RNG semantics."""
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 1, "input tensors length should be 1"
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_dtype = self.get_tensor_type_str(output_tensor.tensor.Type())
+        self._check_random_output_dtype("RANDOM_STANDARD_NORMAL", output_dtype, ["float32"])
+
+        out_shape, _ = self._get_shape_expr_from_tensor(
+            input_tensors[0], "random_standard_normal_dim"
+        )
+        seed, seed2 = self._get_random_options(op)
+        return relax.op.call_dps_packed(
+            "tvm.contrib.random.normal",
+            (seed, seed2, 0.0, 1.0),
+            out_sinfo=relax.TensorStructInfo(out_shape, output_dtype),
+        )
+
+    def convert_multinomial(self, op):
+        """Convert TFLite MULTINOMIAL using stateless seeded RNG semantics."""
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 2, "input tensors length should be 2"
+
+        logits_tensor, num_samples_tensor = input_tensors
+        logits_expr = self.get_tensor_expr(logits_tensor)
+        batch_size = self.get_tensor_shape(logits_tensor)[0]
+        if self.has_expr(num_samples_tensor.tensor_idx):
+            scalar_expr = self.get_expr(num_samples_tensor.tensor_idx)
+            scalar_dtype = self.get_tensor_type_str(num_samples_tensor.tensor.Type())
+            scalar_expr = self.bb.match_cast(scalar_expr, relax.TensorStructInfo([], scalar_dtype))
+            scalar_expr = self.bb.normalize(relax.op.astype(scalar_expr, "int64"))
+            scalar_expr = self.bb.normalize(relax.op.reshape(scalar_expr, [1]))
+            shape_dataflow_var = self.bb.emit(relax.op.tensor_to_shape(scalar_expr))
+            num_samples = tirx.Var("multinomial_num_samples", "int64")
+            self.bb.match_cast(shape_dataflow_var, relax.ShapeStructInfo([num_samples]))
+        else:
+            value = self.get_tensor_value(num_samples_tensor)
+            assert value.size == 1, (
+                "TFLite MULTINOMIAL num_samples must be a scalar tensor, "
+                f"but got {value.size} values"
+            )
+            num_samples = int(value.item())
+        output_batch = batch_size * num_samples
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_dtype = self.get_tensor_type_str(output_tensor.tensor.Type())
+        self._check_random_output_dtype("MULTINOMIAL", output_dtype, ["int32", "int64"])
+
+        seed, seed2 = self._get_random_options(op)
+        uniform_sample = relax.op.call_dps_packed(
+            "tvm.contrib.random.uniform",
+            (seed, seed2, 0.0, 1.0),
+            out_sinfo=relax.TensorStructInfo([output_batch, 1], "float32"),
+        )
+        sample_indices = relax.op.reshape(
+            relax.op.broadcast_to(
+                relax.op.expand_dims(relax.op.arange(batch_size, dtype="int64"), axis=[1]),
+                relax.ShapeExpr([batch_size, num_samples]),
+            ),
+            relax.ShapeExpr([output_batch, 1]),
+        )
+        sampled = relax.op.multinomial_from_uniform(
+            relax.op.nn.softmax(logits_expr, axis=-1),
+            uniform_sample,
+            sample_indices,
+            dtype=output_dtype,
+        )
+        return relax.op.reshape(sampled, relax.ShapeExpr([batch_size, num_samples]))
 
     def _convert_reduce(self, relax_op, op):
         """Generic method to Convert TFLite REDUCE operators"""
