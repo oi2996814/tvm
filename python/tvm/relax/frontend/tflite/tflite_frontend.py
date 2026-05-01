@@ -137,6 +137,7 @@ class OperatorConverter:
             "DEPTHWISE_CONV_2D": functools.partial(self.convert_conv, conv_type="depthwise"),
             "DEQUANTIZE": self.convert_dequantize,
             "DETECTION_POSTPROCESS": self.convert_detection_postprocess,
+            "DILATE": self.convert_dilate,
             "DIV": functools.partial(self._convert_elemwise, relax_op=_op.divide),
             "ELU": self.convert_elu,
             "EQUAL": functools.partial(
@@ -3416,6 +3417,67 @@ class OperatorConverter:
         out = self.dequantize(in_expr, input_tensor)
 
         return out
+
+    def convert_dilate(self, op):
+        """Convert TFLite DILATE"""
+        input_tensors = self.get_input_tensors(op)
+        output_tensors = self.get_output_tensors(op)
+        assert len(input_tensors) == 3, "input tensors length should be 3"
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+
+        in_expr = self.get_tensor_expr(input_tensors[0])
+        in_shape = to_int_list(self.get_tensor_shape(input_tensors[0]))
+        in_dtype = self.get_tensor_type_str(input_tensors[0].tensor.Type())
+        n_dims = len(in_shape)
+
+        dilations_tensor = input_tensors[1]
+        padding_expr = self.get_tensor_expr(input_tensors[2])
+
+        # Runtime dilations bind tensor values to TIR Vars for symbolic 
+        # per-axis math.
+        if self.has_expr(dilations_tensor.tensor_idx):
+            dilations_expr = self.get_expr(dilations_tensor.tensor_idx)
+            dilations_expr = self.bb.match_cast(
+                dilations_expr, relax.TensorStructInfo([n_dims], "int32")
+            )
+            dilations_int64 = self.bb.normalize(relax.op.astype(dilations_expr, "int64"))
+            shape_var = self.bb.emit(relax.op.tensor_to_shape(dilations_int64))
+            stride_vars = [tirx.Var(f"dilate_stride_{i}", "int64") for i in range(n_dims)]
+            self.bb.match_cast(shape_var, relax.ShapeStructInfo(stride_vars))
+            strides = stride_vars
+        else:
+            strides = to_int_list(self.get_tensor_value(dilations_tensor))
+
+        # Per axis: reshape to add a size-1 stride-axis, concat (s-1) padding
+        # values along it, reshape to merge axes (length d*s), trim trailing
+        # pad to TFLite's output dim formula (d-1)*s + 1.
+        result = in_expr
+        current_shape = list(in_shape)
+        axes = list(range(n_dims))
+        ones = [1] * n_dims
+        for axis in range(n_dims):
+            d = current_shape[axis]
+            s = strides[axis]
+            expanded_shape = current_shape[: axis + 1] + [1] + current_shape[axis + 1 :]
+            expanded = relax.op.reshape(result, expanded_shape)
+            pad_shape = list(expanded_shape)
+            pad_shape[axis + 1] = s - 1
+            pad = relax.op.full(pad_shape, padding_expr, dtype=in_dtype)
+            concatted = relax.op.concat([expanded, pad], axis=axis + 1)
+            merged_shape = list(current_shape)
+            merged_shape[axis] = d * s
+            merged = relax.op.reshape(concatted, merged_shape)
+            # (d - 1) * s + 1 is the output dim along this axis.
+            final_dim = (d - 1) * s + 1
+            end = list(merged_shape)
+            end[axis] = final_dim
+            result = relax.op.strided_slice(
+                merged, axes=axes, begin=[0] * n_dims, end=end, strides=ones
+            )
+            current_shape = list(merged_shape)
+            current_shape[axis] = final_dim
+
+        return result
 
     def convert_detection_postprocess(self, op):
         """Convert TFLite_Detection_PostProcess"""
