@@ -126,6 +126,7 @@ class OperatorConverter:
             "BATCH_TO_SPACE_ND": self.convert_batch_to_space_nd,
             "BATCH_MATMUL": self.convert_batch_matmul,
             "BITCAST": self.convert_bitcast,
+            "BROADCAST_TO": self.convert_broadcast_to,
             "BROADCAST_ARGS": self.convert_broadcast_args,
             "CAST": self.convert_cast,
             "CEIL": functools.partial(self._convert_unary_elemwise, relax_op=_op.ceil),
@@ -141,6 +142,7 @@ class OperatorConverter:
             "DILATE": self.convert_dilate,
             "DIV": functools.partial(self._convert_elemwise, relax_op=_op.divide),
             "ELU": self.convert_elu,
+            "EMBEDDING_LOOKUP": self.convert_embedding_lookup,
             "EQUAL": functools.partial(
                 self._convert_elemwise, relax_op=_op.equal, comparison_op=True
             ),
@@ -220,6 +222,7 @@ class OperatorConverter:
             "REVERSE_V2": self.convert_reverse_v2,
             "SCATTER_ND": self.convert_scatter_nd,
             "SELECT": self.convert_select,
+            "SELECT_V2": self.convert_select,
             "SHAPE": self.convert_shape,
             "SIN": functools.partial(self._convert_unary_elemwise, relax_op=_op.sin),
             "SLICE": self.convert_slice,
@@ -1572,7 +1575,7 @@ class OperatorConverter:
         assert axis < data_dim, "Axis out of bounds"
 
         if self.has_expr(indices.tensor_idx):
-            indices_expr = relax.op.cast(self.get_expr(indices.tensor_idx), "int32")
+            indices_expr = relax.op.astype(self.get_expr(indices.tensor_idx), "int32")
         else:
             indices_val = self.get_tensor_value(indices)
             indices_expr = self.exp_tab.new_const(
@@ -3180,6 +3183,31 @@ class OperatorConverter:
         out = relax.op.nn.batch_to_space_nd(in_expr, block_shape, crops)
 
         return out
+
+    def convert_broadcast_to(self, op):
+        """Convert TFLite BROADCAST_TO"""
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 2, "input tensors length should be 2"
+        data = self.get_tensor_expr(input_tensors[0])
+        shape_tensor = input_tensors[1]
+        if self.has_expr(shape_tensor.tensor_idx):
+            shape_expr = self.get_expr(shape_tensor.tensor_idx)
+            shape = self.bb.emit(relax.op.tensor_to_shape(shape_expr))
+        else:
+            shape = to_int_list(self.get_tensor_value(shape_tensor))
+        return relax.op.broadcast_to(data, shape)
+
+    def convert_embedding_lookup(self, op):
+        """Convert TFLite EMBEDDING_LOOKUP"""
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 2, "input tensors length should be 2"
+        params = self.get_tensor_expr(input_tensors[0])
+        indices_tensor = input_tensors[1]
+        if self.has_expr(indices_tensor.tensor_idx):
+            indices = relax.op.astype(self.get_expr(indices_tensor.tensor_idx), "int32")
+        else:
+            indices = self.get_tensor_expr(indices_tensor)
+        return relax.op.take(params, indices, axis=0)
 
     def convert_batch_matmul(self, op):
         """batch_matmul implementation."""
